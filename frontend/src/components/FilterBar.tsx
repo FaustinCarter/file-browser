@@ -98,7 +98,44 @@ export default function FilterBar({ datasetId, filters, onChange }: Props) {
         />
       </div>
 
-      {(selected.size > 0 || filters.accessed_after || filters.accessed_before) && (
+      <div className="filter-group">
+        <label>No Transfer</label>
+        <select
+          value={filters.no_transfer || ""}
+          onChange={(e) =>
+            onChange({
+              ...filters,
+              no_transfer: (e.target.value || undefined) as "yes" | "no" | undefined,
+            })
+          }
+        >
+          <option value="">Any</option>
+          <option value="no">Hide marked</option>
+          <option value="yes">Only marked</option>
+        </select>
+      </div>
+      <div className="filter-group">
+        <label>Processed</label>
+        <select
+          value={filters.processed || ""}
+          onChange={(e) =>
+            onChange({
+              ...filters,
+              processed: (e.target.value || undefined) as "yes" | "no" | undefined,
+            })
+          }
+        >
+          <option value="">Any</option>
+          <option value="no">Hide processed</option>
+          <option value="yes">Only processed</option>
+        </select>
+      </div>
+
+      {(selected.size > 0 ||
+        filters.accessed_after ||
+        filters.accessed_before ||
+        filters.no_transfer ||
+        filters.processed) && (
         <div className="filter-group">
           <label>&nbsp;</label>
           <button

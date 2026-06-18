@@ -89,20 +89,20 @@ def test_annotation_inheritance(client, loaded):
     reports = _find(client, ds["id"], "Reports")
     deck = _find(client, ds["id"], "deck.pptx")
 
-    # Mark the Reports folder as keep=True
-    client.patch(f"/api/nodes/{reports['id']}/annotation", json={"keep": True})
+    # Mark the Reports folder as no_transfer=True
+    client.patch(f"/api/nodes/{reports['id']}/annotation", json={"no_transfer": True})
 
-    # deck.pptx (a child) should inherit keep=True
+    # deck.pptx (a child) should inherit no_transfer=True
     deck_after = client.get(f"/api/nodes/{deck['id']}").json()
-    assert deck_after["effective"]["keep"] is True
-    assert "keep" in deck_after["inherited_fields"]
-    assert deck_after["own"]["keep"] is None
+    assert deck_after["effective"]["no_transfer"] is True
+    assert "no_transfer" in deck_after["inherited_fields"]
+    assert deck_after["own"]["no_transfer"] is None
 
     # Override on the child wins
-    client.patch(f"/api/nodes/{deck['id']}/annotation", json={"keep": False})
+    client.patch(f"/api/nodes/{deck['id']}/annotation", json={"no_transfer": False})
     deck_override = client.get(f"/api/nodes/{deck['id']}").json()
-    assert deck_override["effective"]["keep"] is False
-    assert "keep" not in deck_override["inherited_fields"]
+    assert deck_override["effective"]["no_transfer"] is False
+    assert "no_transfer" not in deck_override["inherited_fields"]
 
 
 def test_bulk_annotation_stamps_descendants(client, loaded):
@@ -138,20 +138,20 @@ def test_filtered_folder_flag_only_matching_type(client, loaded):
             "files_only": True,
             "include_self": False,
             "types": ["PPTX File"],
-            "values": {"keep": True},
+            "values": {"no_transfer": True},
         },
     )
     assert r.json()["updated"] == 2
 
     deck = client.get(f"/api/nodes/{_find(client, ds['id'], 'deck.pptx')['id']}").json()
-    assert deck["effective"]["keep"] is True  # a PPTX got it
+    assert deck["effective"]["no_transfer"] is True  # a PPTX got it
 
     data = client.get(f"/api/nodes/{_find(client, ds['id'], 'data.xlsx')['id']}").json()
-    assert data["effective"]["keep"] is None  # the XLSX did not
+    assert data["effective"]["no_transfer"] is None  # the XLSX did not
 
     # the folder itself is untouched
     rep = client.get(f"/api/nodes/{reports['id']}").json()
-    assert rep["own"]["keep"] is None
+    assert rep["own"]["no_transfer"] is None
 
 
 def test_filtered_folder_flag_respects_last_accessed(client, loaded):
@@ -165,15 +165,91 @@ def test_filtered_folder_flag_respects_last_accessed(client, loaded):
             "files_only": True,
             "include_self": False,
             "accessed_after": "2023-01-01",
-            "values": {"keep": True},
+            "values": {"no_transfer": True},
         },
     )
     assert r.json()["updated"] == 2  # deck + data, not notes
 
     notes = client.get(f"/api/nodes/{_find(client, ds['id'], 'notes.pptx')['id']}").json()
-    assert notes["effective"]["keep"] is None  # old file excluded
+    assert notes["effective"]["no_transfer"] is None  # old file excluded
     deck = client.get(f"/api/nodes/{_find(client, ds['id'], 'deck.pptx')['id']}").json()
-    assert deck["effective"]["keep"] is True
+    assert deck["effective"]["no_transfer"] is True
+
+
+def test_grid_effective_flag_filter_hides_marked(client, loaded):
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    # Mark the whole Reports subtree no_transfer via the folder-flag endpoint.
+    client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True},
+    )
+    # Hide marked -> only the 2 Images files remain.
+    hidden = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "is_dir": False, "no_transfer": "no"},
+    ).json()
+    names = {i["name"] for i in hidden["items"]}
+    assert names == {"a.jpg", "b.png"}
+    # Show only marked -> the 3 Reports files.
+    shown = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "is_dir": False, "no_transfer": "yes"},
+    ).json()
+    assert shown["total"] == 3
+
+
+def test_folder_flag_whole_subtree_rollup(client, loaded):
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True},
+    )
+    rep = client.get(f"/api/nodes/{reports['id']}").json()
+    assert rep["total_files"] == 3
+    assert rep["no_transfer_marked"] == 3  # fully marked
+    assert rep["own"]["no_transfer"] is True
+
+    # Clear it again.
+    client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "no_transfer", "value": None},
+    )
+    rep2 = client.get(f"/api/nodes/{reports['id']}").json()
+    assert rep2["no_transfer_marked"] == 0
+    assert rep2["own"]["no_transfer"] is None
+
+
+def test_folder_flag_scoped_is_indeterminate(client, loaded):
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    # Mark only PPTX under Reports -> 2 of 3 files -> indeterminate folder.
+    client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True, "types": ["PPTX File"]},
+    )
+    rep = client.get(f"/api/nodes/{reports['id']}").json()
+    assert rep["total_files"] == 3
+    assert rep["no_transfer_marked"] == 2  # mixed -> UI shows indeterminate/irregular
+    assert rep["own"]["no_transfer"] is None  # folder itself stays unset
+
+
+def test_tree_hide_marked_drops_fully_marked_folder(client, loaded):
+    ds = loaded
+    root = client.get("/api/tree/children", params={"dataset_id": ds["id"]}).json()["children"][0]
+    images = _find(client, ds["id"], "Images")
+    client.post(
+        f"/api/nodes/{images['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True},
+    )
+    kids = client.get(
+        "/api/tree/children",
+        params={"dataset_id": ds["id"], "parent_id": root["id"], "no_transfer": "no"},
+    ).json()["children"]
+    names = {k["name"] for k in kids}
+    assert "Images" not in names  # fully marked -> dropped
+    assert "Reports" in names
 
 
 def test_search_filters_and_pagination(client, loaded):

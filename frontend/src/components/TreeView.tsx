@@ -1,6 +1,15 @@
 import { useCallbackRef } from "../hooks";
 import { useEffect, useState } from "react";
-import { api, Filters, fmtBytes, NodeOut } from "../api";
+import { api, FlagState, Filters, fmtBytes, folderFlagState, NodeOut } from "../api";
+
+function flagState(node: NodeOut, field: "no_transfer" | "processed"): FlagState {
+  if (node.is_dir) {
+    const marked =
+      field === "no_transfer" ? node.no_transfer_marked : node.processed_marked;
+    return folderFlagState(marked, node.total_files);
+  }
+  return node.effective?.[field] ? "all" : "none";
+}
 
 interface Props {
   datasetId: number;
@@ -107,8 +116,26 @@ function TreeNode({
         </span>
         <span className="icon">{node.is_dir ? "📁" : "📄"}</span>
         <span className="nm">{node.name}</span>
-        {eff?.keep && <span className="badge keep">KEEP</span>}
-        {eff?.processed && <span className="badge proc">PROC</span>}
+        {(() => {
+          const nt = flagState(node, "no_transfer");
+          const pr = flagState(node, "processed");
+          return (
+            <>
+              {nt === "all" && <span className="badge keep">NO XFER</span>}
+              {nt === "some" && (
+                <span className="badge warn" title="Mixed: some files not marked">
+                  NO XFER⚠
+                </span>
+              )}
+              {pr === "all" && <span className="badge proc">PROC</span>}
+              {pr === "some" && (
+                <span className="badge warn" title="Mixed: some files not processed">
+                  PROC⚠
+                </span>
+              )}
+            </>
+          );
+        })()}
         {eff?.jira_ticket && <span className="badge">{eff.jira_ticket}</span>}
         <span className="meta">
           {node.is_dir ? (

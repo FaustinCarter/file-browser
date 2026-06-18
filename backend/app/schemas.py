@@ -18,7 +18,7 @@ class DatasetOut(BaseModel):
 
 class EffectiveAnnotation(BaseModel):
     processed: bool | None = None
-    keep: bool | None = None
+    no_transfer: bool | None = None
     target_location: str | None = None
     jira_ticket: str | None = None
     comment: str | None = None
@@ -56,6 +56,10 @@ class NodeOut(BaseModel):
     # folder aggregates (respecting active filters), only for directories
     filtered_file_count: int | None = None
     filtered_total_size: int | None = None
+    # folder boolean rollups over descendant files (for tri-state checkboxes)
+    total_files: int | None = None
+    no_transfer_marked: int | None = None
+    processed_marked: int | None = None
 
 
 class TreeChildrenOut(BaseModel):
@@ -82,11 +86,26 @@ class FolderStatsOut(BaseModel):
 class AnnotationUpdate(BaseModel):
     # Use a sentinel-free approach: only fields explicitly provided are applied.
     processed: bool | None = None
-    keep: bool | None = None
+    no_transfer: bool | None = None
     target_location: str | None = None
     jira_ticket: str | None = None
     comment: str | None = None
     user_name: str | None = None
+
+
+class FolderFlagUpdate(BaseModel):
+    """Set/clear a rollup boolean on a folder.
+
+    With no filter the whole subtree is affected (descendant overrides are
+    cleared and the folder's own value is set). With a type/last-accessed filter
+    the action is scoped to the matching files only, leaving the folder's own
+    value untouched (so it stays unchecked/indeterminate until all files match).
+    """
+    field: str  # "no_transfer" or "processed"
+    value: bool | None  # True = mark, None = clear/unmark
+    types: list[str] | None = None
+    accessed_after: date | None = None
+    accessed_before: date | None = None
 
 
 class BulkAnnotationUpdate(BaseModel):

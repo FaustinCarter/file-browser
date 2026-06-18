@@ -132,6 +132,7 @@ a { color: var(--accent); }
 .badge { font-size: 10px; padding: 0 5px; border-radius: 8px; background: var(--border); color: var(--text); }
 .badge.keep { background: #1f4a36; color: #7fe0ad; }
 .badge.proc { background: #4a3b1f; color: #e6c178; }
+.badge.warn { background: #4a2a1f; color: #e6a178; }
 
 .detail { padding: 12px; }
 .detail h2 { font-size: 14px; margin: 0 0 2px; word-break: break-all; }

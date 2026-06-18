@@ -11,10 +11,32 @@ from fastapi.staticfiles import StaticFiles
 
 from .database import Base, engine
 from .routers import datasets, nodes, tree
+from sqlalchemy import text
+
+
+def _migrate():
+    """Idempotent, in-place schema tweaks for existing deployments."""
+    with engine.begin() as conn:
+        # keep -> no_transfer rename (preserves existing annotations).
+        has_keep = conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='annotations' AND column_name='keep'"
+            )
+        ).first()
+        has_new = conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='annotations' AND column_name='no_transfer'"
+            )
+        ).first()
+        if has_keep and not has_new:
+            conn.execute(text("ALTER TABLE annotations RENAME COLUMN keep TO no_transfer"))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _migrate()
     Base.metadata.create_all(bind=engine)
     yield
 

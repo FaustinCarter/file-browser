@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, not_, select
 from sqlalchemy.orm import Session
 
 from .. import services
@@ -14,6 +14,7 @@ from ..schemas import (
     AnnotationUpdate,
     BulkAnnotationUpdate,
     CountsOut,
+    FolderFlagUpdate,
     FolderStatsOut,
     FolderTypeCountRequest,
     NodeOut,
@@ -43,8 +44,8 @@ def search(
     owner: str | None = Query(None),
     is_dir: bool | None = Query(None),
     jira: str | None = Query(None),
-    processed: bool | None = Query(None),
-    keep: bool | None = Query(None),
+    processed: str | None = Query(None, description="'yes' (marked) / 'no' (unmarked)"),
+    no_transfer: str | None = Query(None, description="'yes' (marked) / 'no' (unmarked)"),
     accessed_after: date | None = Query(None),
     accessed_before: date | None = Query(None),
     under_node_id: int | None = Query(None, description="restrict to a subtree"),
@@ -56,9 +57,12 @@ def search(
 ):
     """Flat, paginated, filterable grid view across the dataset.
 
-    Annotation filters (jira/processed/keep) match a node's **own** override
-    values; effective inherited values are still returned for display.
+    The processed / no_transfer filters match a node's **effective** value
+    (own or inherited from a parent folder). The jira filter matches own values.
     """
+    f = services.build_filters(
+        db, dataset_id, no_transfer=no_transfer, processed=processed,
+    )
     conds = [Node.dataset_id == dataset_id]
     if q:
         conds.append(Node.full_path.ilike(f"%{q}%"))
@@ -77,17 +81,19 @@ def search(
         if not parent:
             raise HTTPException(status_code=404, detail="under_node_id not found")
         conds.append(Node.mat_path.like(f"{parent.mat_path}%"))
+    if no_transfer == "yes":
+        conds.append(f["nt_clause"])
+    elif no_transfer == "no":
+        conds.append(not_(f["nt_clause"]))
+    if processed == "yes":
+        conds.append(f["proc_clause"])
+    elif processed == "no":
+        conds.append(not_(f["proc_clause"]))
 
-    need_ann = jira is not None or processed is not None or keep is not None
     stmt = select(Node)
-    if need_ann:
+    if jira is not None:
         stmt = stmt.join(Annotation, Annotation.node_id == Node.id)
-        if jira is not None:
-            conds.append(Annotation.jira_ticket == jira)
-        if processed is not None:
-            conds.append(Annotation.processed.is_(processed))
-        if keep is not None:
-            conds.append(Annotation.keep.is_(keep))
+        conds.append(Annotation.jira_ticket == jira)
 
     stmt = stmt.where(and_(*conds))
 
@@ -100,7 +106,9 @@ def search(
     stmt = stmt.order_by(col).offset((page - 1) * page_size).limit(page_size)
 
     nodes = list(db.execute(stmt).scalars().all())
-    items = build_node_outs(db, nodes, with_folder_stats=False)
+    items = build_node_outs(
+        db, nodes, nt_clause=f["nt_clause"], proc_clause=f["proc_clause"],
+    )
     return {"total": int(total), "page": page, "page_size": page_size, "items": items}
 
 
@@ -127,12 +135,19 @@ def folder_type_counts(req: FolderTypeCountRequest, db: Session = Depends(get_db
     return {"results": result}
 
 
+def _single_node_out(db: Session, node: Node) -> NodeOut:
+    f = services.build_filters(db, node.dataset_id)
+    return build_node_outs(
+        db, [node], nt_clause=f["nt_clause"], proc_clause=f["proc_clause"]
+    )[0]
+
+
 @router.get("/{node_id}", response_model=NodeOut)
 def get_node(node_id: int, db: Session = Depends(get_db)):
     node = db.get(Node, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-    return build_node_outs(db, [node])[0]
+    return _single_node_out(db, node)
 
 
 @router.get("/{node_id}/counts", response_model=CountsOut)
@@ -190,7 +205,51 @@ def update_annotation(
     services.upsert_annotation(db, node, values)
     db.commit()
     db.refresh(node)
-    return build_node_outs(db, [node])[0]
+    return _single_node_out(db, node)
+
+
+@router.post("/{node_id}/folder-flag", response_model=NodeOut)
+def folder_flag(node_id: int, payload: FolderFlagUpdate, db: Session = Depends(get_db)):
+    """Set/clear a rollup boolean (no_transfer/processed) on a folder.
+
+    No filter -> the whole subtree: clear any descendant overrides, then set the
+    folder's own value (so every file is effectively marked/unmarked).
+    With a type/last-accessed filter -> only the matching files are touched and
+    the folder's own value is left alone (it becomes indeterminate).
+    """
+    node = db.get(Node, node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    if not node.is_dir:
+        raise HTTPException(status_code=400, detail="Node is not a folder")
+    if payload.field not in services.BOOLEAN_FLAG_FIELDS:
+        raise HTTPException(status_code=400, detail="Unsupported field")
+
+    scoped = bool(payload.types or payload.accessed_after or payload.accessed_before)
+    field = payload.field
+    if scoped:
+        # Only the matching files; leave the folder's own value untouched.
+        if payload.value is None:
+            services.clear_field_under(
+                db, node, field, include_self=False, files_only=True,
+                types=payload.types, accessed_after=payload.accessed_after,
+                accessed_before=payload.accessed_before,
+            )
+        else:
+            services.bulk_set_under(
+                db, node, {field: payload.value}, include_self=False,
+                files_only=True, types=payload.types,
+                accessed_after=payload.accessed_after,
+                accessed_before=payload.accessed_before,
+            )
+    else:
+        # Whole subtree: wipe descendant overrides so the folder's value governs.
+        services.clear_field_under(db, node, field, include_self=True)
+        if payload.value is not None:
+            services.upsert_annotation(db, node, {field: payload.value})
+    db.commit()
+    db.refresh(node)
+    return _single_node_out(db, node)
 
 
 @router.post("/bulk-annotation")

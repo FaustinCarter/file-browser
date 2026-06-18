@@ -4,7 +4,7 @@ A fast, centrally-deployed tool for **categorizing, exploring, and tagging**
 millions of files ahead of a file-server migration. You feed it the CSV exports
 produced by a Windows disk-usage tool (TreeSize-style, one row per filesystem
 object) and get an interactive tree explorer, a filterable grid, recursive
-type/size analytics, and editable migration metadata (Keep/Processed flags,
+type/size analytics, and editable migration metadata (No-Transfer/Processed flags,
 target location, JIRA ticket, comments) — all shared by your whole team.
 
 ---
@@ -18,10 +18,15 @@ target location, JIRA ticket, comments) — all shared by your whole team.
   that respects the active filters**.
 - **Grid / bulk-edit view** — flat, paginated, sortable, filterable table with
   inline editing and multi-row bulk actions.
-- **Inherited + override tagging.** Mark a folder `Keep` and every file inside
-  inherits it automatically (no mass row rewrites); override any individual file
-  or subfolder. A separate "bulk stamp" writes concrete values (e.g. one JIRA
-  ticket onto hundreds of filtered files at once).
+- **Inherited + override tagging.** Mark a folder `No Transfer`/`Processed` and
+  every file inside inherits it automatically (no mass row rewrites); override
+  any individual file or subfolder. A separate "bulk stamp" writes concrete
+  values (e.g. one JIRA ticket onto hundreds of filtered files at once).
+- **Tri-state folder flags + hide filters.** A folder's No-Transfer/Processed
+  checkbox rolls up its files (checked = all, **indeterminate = mixed/irregular**,
+  empty = none). Filter either boolean in the tree or grid to hide rows you've
+  already handled; fully-marked folders drop out, partly-marked ones stay with a
+  ⚠ marker.
 - **Original CSV columns are always read-only**; all migration metadata is
   editable.
 - **Multi-CSV.** Upload as many exports as you like; each becomes an independent
@@ -109,11 +114,13 @@ into sortable numeric values while the original strings are kept for display.
   "Nested (total)" line / `GET /api/nodes/{id}/counts`.
 - *All file types in a folder with counts, sortable & filterable* — the detail
   panel's "File types here" table / `GET /api/nodes/{id}/type-breakdown`.
-- *Mark files/folders Keep/Processed (recursive)* — checkboxes in the detail or
-  grid view; folders cascade via inheritance. **With a tree filter active**
-  (file type and/or last-accessed), editing a folder applies only to the
-  *matching* files in its subtree — other types and the folder itself are left
-  untouched.
+- *Mark files/folders No-Transfer/Processed (recursive)* — checkboxes in the
+  detail or grid view; folders cascade to all their files. **With a tree filter
+  active** (file type and/or last-accessed), checking a folder applies only to
+  the *matching* files in its subtree — other types are left untouched and the
+  folder stays indeterminate until every file is marked.
+- *Hide what you've handled* — filter the tree or grid by No-Transfer/Processed
+  to drop marked rows (and fully-marked folders) from view.
 - *Target location, JIRA ticket, comment, user* — editable columns; bulk-edit by
   selection (grid) or by filtered subtree (detail panel's "Bulk stamp").
 

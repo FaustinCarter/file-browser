@@ -27,9 +27,9 @@ def build_node_outs(
     db: Session,
     nodes: list[Node],
     *,
-    types: list[str] | None = None,
-    accessed_after: date | None = None,
-    accessed_before: date | None = None,
+    view_filter=None,
+    nt_clause=None,
+    proc_clause=None,
     with_folder_stats: bool = True,
 ) -> list[NodeOut]:
     if not nodes:
@@ -73,11 +73,14 @@ def build_node_outs(
             inherited_fields=inherited,
         )
         if n.is_dir and with_folder_stats:
-            stats = services.folder_stats(
-                db, n, types=types, accessed_after=accessed_after,
-                accessed_before=accessed_before,
+            m = services.folder_metrics(
+                db, n, view_filter=view_filter, nt_clause=nt_clause,
+                proc_clause=proc_clause,
             )
-            item.filtered_file_count = stats["file_count"]
-            item.filtered_total_size = stats["total_size"]
+            item.filtered_file_count = m["filtered_file_count"]
+            item.filtered_total_size = m["filtered_total_size"]
+            item.total_files = m["total_files"]
+            item.no_transfer_marked = m["no_transfer_marked"]
+            item.processed_marked = m["processed_marked"]
         out.append(item)
     return out

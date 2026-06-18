@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, Annotation, fmtBytes, NodeOut } from "../api";
+import { api, Annotation, FlagField, fmtBytes, folderFlagState, NodeOut } from "../api";
 
 interface Props {
   datasetId: number;
@@ -21,7 +21,7 @@ export default function GridView({ datasetId, userName, toast }: Props) {
   // filters
   const [q, setQ] = useState("");
   const [isDir, setIsDir] = useState<string>("");
-  const [keep, setKeep] = useState<string>("");
+  const [noTransfer, setNoTransfer] = useState<string>("");
   const [processed, setProcessed] = useState<string>("");
   const [jira, setJira] = useState("");
 
@@ -32,8 +32,8 @@ export default function GridView({ datasetId, userName, toast }: Props) {
         dataset_id: datasetId,
         q: q || undefined,
         is_dir: isDir === "" ? undefined : isDir === "true",
-        keep: keep === "" ? undefined : keep === "true",
-        processed: processed === "" ? undefined : processed === "true",
+        no_transfer: noTransfer || undefined,
+        processed: processed || undefined,
         jira: jira || undefined,
         sort,
         direction: dir,
@@ -87,6 +87,22 @@ export default function GridView({ datasetId, userName, toast }: Props) {
     }
   }
 
+  // Toggle a rollup boolean. Folders go through the folder-flag endpoint (whole
+  // subtree); files set their own value.
+  async function setFlag(n: NodeOut, field: FlagField, value: boolean | null) {
+    try {
+      const updated = n.is_dir
+        ? await api.folderFlag(n.id, { field, value })
+        : await api.updateAnnotation(n.id, {
+            [field]: value,
+            ...(userName ? { user_name: userName } : {}),
+          } as Partial<Annotation>);
+      setItems((prev) => prev.map((it) => (it.id === n.id ? updated : it)));
+    } catch (e: any) {
+      toast(String(e.message || e), true);
+    }
+  }
+
   async function bulkApply(values: Partial<Annotation>) {
     if (selected.size === 0) return;
     if (userName) values.user_name = userName;
@@ -120,19 +136,19 @@ export default function GridView({ datasetId, userName, toast }: Props) {
           </select>
         </div>
         <div className="filter-group">
-          <label>Keep</label>
-          <select value={keep} onChange={(e) => setKeep(e.target.value)}>
+          <label>No Transfer</label>
+          <select value={noTransfer} onChange={(e) => setNoTransfer(e.target.value)}>
             <option value="">Any</option>
-            <option value="true">Yes</option>
-            <option value="false">No</option>
+            <option value="no">Hide marked</option>
+            <option value="yes">Only marked</option>
           </select>
         </div>
         <div className="filter-group">
           <label>Processed</label>
           <select value={processed} onChange={(e) => setProcessed(e.target.value)}>
             <option value="">Any</option>
-            <option value="true">Yes</option>
-            <option value="false">No</option>
+            <option value="no">Hide processed</option>
+            <option value="yes">Only processed</option>
           </select>
         </div>
         <div className="filter-group">
@@ -174,7 +190,7 @@ export default function GridView({ datasetId, userName, toast }: Props) {
               <th onClick={() => setSortCol("size")}>Size</th>
               <th onClick={() => setSortCol("last_accessed")}>Last Acc.</th>
               <th onClick={() => setSortCol("owner")}>Owner</th>
-              <th>Keep</th>
+              <th>No Xfer</th>
               <th>Proc.</th>
               <th>JIRA</th>
               <th>Target location</th>
@@ -190,6 +206,7 @@ export default function GridView({ datasetId, userName, toast }: Props) {
                 selected={selected.has(n.id)}
                 onToggle={() => toggleSel(n.id)}
                 onPatch={patch}
+                onFlag={setFlag}
               />
             ))}
             {items.length === 0 && !loading && (
@@ -219,16 +236,64 @@ export default function GridView({ datasetId, userName, toast }: Props) {
   );
 }
 
+function FlagCell({
+  n,
+  field,
+  onFlag,
+}: {
+  n: NodeOut;
+  field: FlagField;
+  onFlag: (n: NodeOut, field: FlagField, value: boolean | null) => void;
+}) {
+  if (n.is_dir) {
+    const marked = field === "no_transfer" ? n.no_transfer_marked : n.processed_marked;
+    const state = folderFlagState(marked, n.total_files);
+    return (
+      <td
+        title={
+          state === "some"
+            ? `Mixed: ${marked}/${n.total_files} files marked`
+            : `${marked}/${n.total_files} files`
+        }
+      >
+        <input
+          type="checkbox"
+          ref={(el) => {
+            if (el) el.indeterminate = state === "some";
+          }}
+          checked={state === "all"}
+          disabled={(n.total_files || 0) === 0}
+          onChange={(e) => onFlag(n, field, e.target.checked ? true : null)}
+        />
+      </td>
+    );
+  }
+  const eff = n.effective!;
+  const inh = new Set(n.inherited_fields);
+  return (
+    <td title={inh.has(field) ? "inherited from folder" : ""}>
+      <input
+        type="checkbox"
+        checked={!!eff[field]}
+        style={inh.has(field) ? { opacity: 0.5 } : undefined}
+        onChange={(e) => onFlag(n, field, e.target.checked ? true : null)}
+      />
+    </td>
+  );
+}
+
 function GridRow({
   n,
   selected,
   onToggle,
   onPatch,
+  onFlag,
 }: {
   n: NodeOut;
   selected: boolean;
   onToggle: () => void;
   onPatch: (id: number, v: Partial<Annotation>) => void;
+  onFlag: (n: NodeOut, field: FlagField, value: boolean | null) => void;
 }) {
   const eff = n.effective!;
   const inh = new Set(n.inherited_fields);
@@ -248,22 +313,8 @@ function GridRow({
       <td>{fmtBytes(n.size_bytes)}</td>
       <td>{n.last_accessed || ""}</td>
       <td>{n.owner}</td>
-      <td title={inh.has("keep") ? "inherited" : ""}>
-        <input
-          type="checkbox"
-          checked={!!eff.keep}
-          style={inh.has("keep") ? { opacity: 0.5 } : undefined}
-          onChange={(e) => onPatch(n.id, { keep: e.target.checked })}
-        />
-      </td>
-      <td title={inh.has("processed") ? "inherited" : ""}>
-        <input
-          type="checkbox"
-          checked={!!eff.processed}
-          style={inh.has("processed") ? { opacity: 0.5 } : undefined}
-          onChange={(e) => onPatch(n.id, { processed: e.target.checked })}
-        />
-      </td>
+      <FlagCell n={n} field="no_transfer" onFlag={onFlag} />
+      <FlagCell n={n} field="processed" onFlag={onFlag} />
       <CellInput
         value={eff.jira_ticket || ""}
         inherited={inh.has("jira_ticket")}
@@ -330,10 +381,10 @@ function BulkBar({
   return (
     <div className="bulkbar">
       <span className="chip">{count} selected</span>
-      <button onClick={() => onApply({ keep: true })}>Keep ✓</button>
-      <button onClick={() => onApply({ keep: false })}>Keep ✗</button>
+      <button onClick={() => onApply({ no_transfer: true })}>No Xfer ✓</button>
+      <button onClick={() => onApply({ no_transfer: null })}>No Xfer ✗</button>
       <button onClick={() => onApply({ processed: true })}>Processed ✓</button>
-      <button onClick={() => onApply({ processed: false })}>Processed ✗</button>
+      <button onClick={() => onApply({ processed: null })}>Processed ✗</button>
       <input
         placeholder="JIRA ticket"
         value={jira}

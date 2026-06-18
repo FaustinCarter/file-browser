@@ -9,8 +9,13 @@ API = "http://127.0.0.1:8000"
 
 
 def main():
-    c = httpx.Client(base_url=API, timeout=30)
-    dsid = c.get("/api/datasets").json()[0]["id"]
+    c = httpx.Client(base_url=API, timeout=60)
+    # Fresh dataset so prior test runs don't leak annotations.
+    for d in c.get("/api/datasets").json():
+        c.delete(f"/api/datasets/{d['id']}")
+    with open("/home/user/file-browser/sample_data/fake_fileserver.csv", "rb") as fh:
+        dsid = c.post("/api/datasets", files={"file": ("f.csv", fh, "text/csv")},
+                      data={"name": "Fake Server"}).json()["id"]
 
     def folder(name):
         r = c.get("/api/nodes/search", params={"dataset_id": dsid, "q": name, "is_dir": True, "page_size": 50}).json()
@@ -59,10 +64,11 @@ def main():
         page.wait_for_selector("text=matching file(s)")
         page.screenshot(path="/tmp/shots/06_scoped.png")
 
-        # Click the scoped "Set ✓" button.
-        page.click("button:has-text('Set ✓ on')")
-        page.wait_for_selector("text=Updated")  # toast
-        page.wait_for_timeout(600)
+        # Check the No Transfer box -> scoped to the matching (PPTX) files only.
+        page.locator("label:has-text('No Transfer?')").first.locator(
+            "input[type=checkbox]"
+        ).click()
+        page.wait_for_timeout(900)
         b.close()
 
         real_errors = [e for e in errors if "favicon" not in e.lower()]
@@ -73,17 +79,17 @@ def main():
     # Verify via API.
     kept_pptx = sum(
         1 for f in files_under(legal["id"], "PPTX File")
-        if c.get(f"/api/nodes/{f['id']}").json()["effective"]["keep"] is True
+        if c.get(f"/api/nodes/{f['id']}").json()["effective"]["no_transfer"] is True
     )
     touched_other = [
         f for f in non_pptx
-        if c.get(f"/api/nodes/{f['id']}").json()["effective"]["keep"] is not None
+        if c.get(f"/api/nodes/{f['id']}").json()["effective"]["no_transfer"] is not None
     ]
-    legal_own = c.get(f"/api/nodes/{legal['id']}").json()["own"]["keep"]
+    legal_own = c.get(f"/api/nodes/{legal['id']}").json()["own"]["no_transfer"]
 
     print(f"PPTX now kept: {kept_pptx}/{len(pptx_before)}")
     print(f"non-PPTX touched: {len(touched_other)} (expected 0)")
-    print(f"Legal folder own keep: {legal_own} (expected None)")
+    print(f"Legal folder own no_transfer: {legal_own} (expected None)")
 
     assert kept_pptx == len(pptx_before), "not all PPTX were kept"
     assert touched_other == [], "non-PPTX files were incorrectly modified"

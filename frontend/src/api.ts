@@ -10,12 +10,14 @@ export interface Dataset {
 
 export interface Annotation {
   processed: boolean | null;
-  keep: boolean | null;
+  no_transfer: boolean | null;
   target_location: string | null;
   jira_ticket: string | null;
   comment: string | null;
   user_name: string | null;
 }
+
+export type FlagField = "no_transfer" | "processed";
 
 export interface NodeOut {
   id: number;
@@ -44,12 +46,33 @@ export interface NodeOut {
   inherited_fields: string[];
   filtered_file_count: number | null;
   filtered_total_size: number | null;
+  total_files: number | null;
+  no_transfer_marked: number | null;
+  processed_marked: number | null;
 }
 
 export interface Filters {
   types?: string[];
   accessed_after?: string;
   accessed_before?: string;
+  // tri-state flag filters: undefined (any) | "yes" (only marked) | "no" (hide marked)
+  no_transfer?: "yes" | "no";
+  processed?: "yes" | "no";
+}
+
+// Tri-state rollup of a folder's descendant files for a boolean flag.
+export type FlagState = "empty" | "none" | "some" | "all";
+
+export function folderFlagState(
+  marked: number | null | undefined,
+  total: number | null | undefined,
+): FlagState {
+  const m = marked ?? 0;
+  const t = total ?? 0;
+  if (t === 0) return "empty";
+  if (m === 0) return "none";
+  if (m >= t) return "all";
+  return "some";
 }
 
 function qs(params: Record<string, unknown>): string {
@@ -99,8 +122,26 @@ export const api = {
         types: filters.types,
         accessed_after: filters.accessed_after,
         accessed_before: filters.accessed_before,
+        no_transfer: filters.no_transfer,
+        processed: filters.processed,
       })}`,
     ).then((r) => j<{ parent_id: number | null; children: NodeOut[] }>(r)),
+
+  folderFlag: (
+    nodeId: number,
+    payload: {
+      field: FlagField;
+      value: boolean | null;
+      types?: string[];
+      accessed_after?: string;
+      accessed_before?: string;
+    },
+  ) =>
+    fetch(`/api/nodes/${nodeId}/folder-flag`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then((r) => j<NodeOut>(r)),
 
   node: (id: number) => fetch(`/api/nodes/${id}`).then((r) => j<NodeOut>(r)),
 

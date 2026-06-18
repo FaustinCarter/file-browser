@@ -79,7 +79,7 @@ def run():
         # 7. Select all on page, bulk-set Keep
         page.check("table.grid thead input[type=checkbox]")
         page.wait_for_selector("text=selected")
-        page.click("text=Keep ✓")
+        page.click("text=No Xfer ✓")
         page.wait_for_timeout(500)
         page.screenshot(path=f"{SHOTS}/05_grid_bulk.png")
 

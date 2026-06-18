@@ -3,19 +3,74 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import Select, and_, func, select
+from sqlalchemy import (
+    Select,
+    and_,
+    false as sa_false,
+    func,
+    literal,
+    not_,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.orm import Session
 
 from .models import Annotation, Node
 
 ANNOTATION_FIELDS = (
     "processed",
-    "keep",
+    "no_transfer",
     "target_location",
     "jira_ticket",
     "comment",
     "user_name",
 )
+
+# Booleans that use the folder rollup / hide-filter behaviour.
+BOOLEAN_FLAG_FIELDS = ("processed", "no_transfer")
+
+
+def effective_true_clause(db: Session, dataset_id: int, field: str):
+    """A SQL boolean expression that is true for nodes whose *effective* value of
+    ``field`` is True (own value, else nearest ancestor's).
+
+    Implemented purely from the (sparse) set of override nodes, so it's a plain
+    expression over ``Node.mat_path`` — no per-row subquery or recursive CTE.
+    Each override contributes its subtree minus the subtrees of its nearest
+    descendant overrides, so the total number of LIKE terms is O(overrides).
+    """
+    col = getattr(Annotation, field)
+    rows = db.execute(
+        select(Node.mat_path, col)
+        .join(Annotation, Annotation.node_id == Node.id)
+        .where(Annotation.dataset_id == dataset_id, col.isnot(None))
+    ).all()
+    if not rows:
+        return sa_false()
+
+    value_by_path = {mp: bool(v) for mp, v in rows}
+    paths = sorted(value_by_path)
+    # Build the override forest to find each override's direct child overrides.
+    direct: dict[str, list[str]] = {p: [] for p in paths}
+    stack: list[str] = []
+    for p in paths:
+        while stack and not p.startswith(stack[-1]):
+            stack.pop()
+        if stack:
+            direct[stack[-1]].append(p)
+        stack.append(p)
+
+    clauses = []
+    for p in paths:
+        if not value_by_path[p]:
+            continue  # a False override governs its region; contributes nothing
+        region = Node.mat_path.like(p + "%")
+        kids = direct[p]
+        if kids:
+            region = and_(region, not_(or_(*[Node.mat_path.like(k + "%") for k in kids])))
+        clauses.append(region)
+    return or_(*clauses) if clauses else sa_false()
 
 
 def ancestor_ids_self_first(mat_path: str) -> list[int]:
@@ -110,6 +165,90 @@ def folder_stats(
     return {"file_count": int(row[0]), "total_size": int(row[1])}
 
 
+def build_filters(
+    db: Session,
+    dataset_id: int,
+    *,
+    types: list[str] | None = None,
+    accessed_after: date | None = None,
+    accessed_before: date | None = None,
+    no_transfer: str | None = None,
+    processed: str | None = None,
+) -> dict:
+    """Translate request filter params into reusable SQL clauses.
+
+    ``no_transfer`` / ``processed`` are tri-state: None (any), "yes" (show only
+    effectively-marked), or "no" (hide effectively-marked). The returned
+    ``view_filter`` combines every active filter; ``nt_clause`` / ``proc_clause``
+    are the raw effective-true expressions (used for folder rollups regardless of
+    whether a filter is active).
+    """
+    nt_clause = effective_true_clause(db, dataset_id, "no_transfer")
+    proc_clause = effective_true_clause(db, dataset_id, "processed")
+    conds = []
+    if types:
+        conds.append(Node.file_type.in_(list(types)))
+    if accessed_after:
+        conds.append(Node.last_accessed >= accessed_after)
+    if accessed_before:
+        conds.append(Node.last_accessed <= accessed_before)
+    if no_transfer == "yes":
+        conds.append(nt_clause)
+    elif no_transfer == "no":
+        conds.append(not_(nt_clause))
+    if processed == "yes":
+        conds.append(proc_clause)
+    elif processed == "no":
+        conds.append(not_(proc_clause))
+    return {
+        "view_filter": and_(*conds) if conds else None,
+        "nt_clause": nt_clause,
+        "proc_clause": proc_clause,
+        "filter_active": bool(conds),
+    }
+
+
+def folder_metrics(
+    db: Session,
+    node: Node,
+    *,
+    view_filter=None,
+    nt_clause=None,
+    proc_clause=None,
+) -> dict:
+    """One-query rollup over a folder's descendant files.
+
+    Returns the filtered file count/size (what the tree should display given the
+    active filters) plus the total file count and how many files are *effectively*
+    marked no_transfer / processed (for the folder's tri-state checkbox).
+    """
+    base = [
+        Node.dataset_id == node.dataset_id,
+        Node.mat_path.like(f"{node.mat_path}%"),
+        Node.id != node.id,
+        Node.is_dir.is_(False),
+    ]
+    filtered_count = func.count().filter(view_filter) if view_filter is not None else func.count()
+    filtered_size = (
+        func.coalesce(func.sum(Node.size_bytes).filter(view_filter), 0)
+        if view_filter is not None
+        else func.coalesce(func.sum(Node.size_bytes), 0)
+    )
+    nt = func.count().filter(nt_clause) if nt_clause is not None else literal(0)
+    pc = func.count().filter(proc_clause) if proc_clause is not None else literal(0)
+
+    row = db.execute(
+        select(func.count(), filtered_count, filtered_size, nt, pc).where(and_(*base))
+    ).one()
+    return {
+        "total_files": int(row[0]),
+        "filtered_file_count": int(row[1]),
+        "filtered_total_size": int(row[2]),
+        "no_transfer_marked": int(row[3]),
+        "processed_marked": int(row[4]),
+    }
+
+
 def folder_counts(db: Session, node: Node) -> dict:
     """Total nested file + folder counts (unfiltered) under ``node``."""
     base = [
@@ -176,6 +315,42 @@ def upsert_annotation(db: Session, node: Node, values: dict) -> Annotation:
             setattr(ann, k, v)
     db.flush()
     return ann
+
+
+def clear_field_under(
+    db: Session,
+    folder: Node,
+    field: str,
+    *,
+    include_self: bool = True,
+    files_only: bool = False,
+    types: list[str] | None = None,
+    accessed_after: date | None = None,
+    accessed_before: date | None = None,
+) -> int:
+    """Null out ``field`` on existing annotations within ``folder``'s subtree.
+
+    Updates only rows that already exist (no annotation rows are created just to
+    store a NULL), so it's cheap even on huge subtrees.
+    """
+    conds = [
+        Node.dataset_id == folder.dataset_id,
+        Node.mat_path.like(f"{folder.mat_path}%"),
+    ]
+    if not include_self:
+        conds.append(Node.id != folder.id)
+    if files_only:
+        conds.append(Node.is_dir.is_(False))
+    _apply_file_filters(conds, types=types, accessed_after=accessed_after,
+                        accessed_before=accessed_before)
+    subq = select(Node.id).where(and_(*conds))
+    result = db.execute(
+        update(Annotation)
+        .where(Annotation.node_id.in_(subq))
+        .values(**{field: None})
+    )
+    db.flush()
+    return result.rowcount or 0
 
 
 def bulk_set_under(

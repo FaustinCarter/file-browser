@@ -113,7 +113,7 @@ class Annotation(Base):
 
     # NULL == inherit from nearest ancestor with a value.
     processed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    keep: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    no_transfer: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     target_location: Mapped[str | None] = mapped_column(Text, nullable=True)
     jira_ticket: Mapped[str | None] = mapped_column(Text, nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)

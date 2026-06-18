@@ -1,5 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
-import { api, Annotation, Filters, fmtBytes, NodeOut } from "../api";
+import {
+  api,
+  Annotation,
+  Filters,
+  FlagField,
+  fmtBytes,
+  folderFlagState,
+  NodeOut,
+} from "../api";
+
+const FLAGS: { field: FlagField; label: string }[] = [
+  { field: "no_transfer", label: "No Transfer?" },
+  { field: "processed", label: "Processed?" },
+];
 
 interface Props {
   nodeId: number;
@@ -60,7 +73,6 @@ export default function DetailPanel({
   if (!node) return <div className="detail muted">Loading…</div>;
 
   const eff = node.effective!;
-  const own = node.own!;
   const inh = new Set(node.inherited_fields);
 
   async function save(values: Partial<Annotation>) {
@@ -93,6 +105,26 @@ export default function DetailPanel({
       toast(`Updated ${r.updated.toLocaleString()} matching file(s)`);
       onMutated();
       reload();
+    } catch (e: any) {
+      toast(String(e.message || e), true);
+    }
+  }
+
+  // Set/clear a rollup boolean on a folder. When a filter is active the change
+  // is scoped to the matching files (folder stays indeterminate); otherwise the
+  // whole subtree is affected.
+  async function setFolderFlag(field: FlagField, value: boolean | null) {
+    try {
+      const updated = await api.folderFlag(nodeId, {
+        field,
+        value,
+        types: filterActive ? filters.types : undefined,
+        accessed_after: filterActive ? filters.accessed_after : undefined,
+        accessed_before: filterActive ? filters.accessed_before : undefined,
+      });
+      setNode(updated);
+      onMutated();
+      toast(value === null ? "Cleared" : "Saved");
     } catch (e: any) {
       toast(String(e.message || e), true);
     }
@@ -150,48 +182,42 @@ export default function DetailPanel({
           {node.is_dir &&
             (filterActive
               ? " — filter active: matching files only"
-              : " (applies to contents via inheritance)")}
+              : "")}
         </h3>
+
+        {/* Boolean flags: folders show a tri-state rollup of their files. */}
+        <div style={{ marginBottom: 10 }}>
+          {FLAGS.map((f) =>
+            node.is_dir ? (
+              <FolderFlag
+                key={f.field}
+                label={f.label}
+                marked={
+                  f.field === "no_transfer"
+                    ? node.no_transfer_marked
+                    : node.processed_marked
+                }
+                total={node.total_files}
+                scoped={filterActive}
+                onSet={(v) => setFolderFlag(f.field, v)}
+              />
+            ) : (
+              <FileFlag
+                key={f.field}
+                label={f.label}
+                checked={!!eff[f.field]}
+                inherited={inh.has(f.field)}
+                onSet={(v) => save({ [f.field]: v } as Partial<Annotation>)}
+                onClear={() => save({ [f.field]: null } as Partial<Annotation>)}
+              />
+            ),
+          )}
+        </div>
+
         {node.is_dir && filterActive ? (
           <ScopedFolderEdit matchCount={matchCount} onApply={applyScoped} />
         ) : (
           <>
-            <div className="checks">
-              <label>
-                <input
-                  type="checkbox"
-                  ref={(el) => {
-                    if (el) el.indeterminate = own.keep === null && inh.has("keep");
-                  }}
-                  checked={!!eff.keep}
-                  onChange={(e) => save({ keep: e.target.checked })}
-                />
-                Keep?{" "}
-                {inh.has("keep") && <span className="inherited">(inherited)</span>}
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={!!eff.processed}
-                  onChange={(e) => save({ processed: e.target.checked })}
-                />
-                Processed?{" "}
-                {inh.has("processed") && (
-                  <span className="inherited">(inherited)</span>
-                )}
-              </label>
-            </div>
-            {(eff.keep !== null || eff.processed !== null) && (
-              <div style={{ marginBottom: 8 }}>
-                <button
-                  onClick={() => save({ keep: null, processed: null })}
-                  title="Clear flags on this node (revert to inheriting from parent)"
-                >
-                  Clear flags → inherit
-                </button>
-              </div>
-            )}
-
             {EDIT_FIELDS.map((f) => (
               <EditableField
                 key={f.key}
@@ -264,6 +290,92 @@ function EditableField({
   );
 }
 
+function FolderFlag({
+  label,
+  marked,
+  total,
+  scoped,
+  onSet,
+}: {
+  label: string;
+  marked: number | null;
+  total: number | null;
+  scoped: boolean;
+  onSet: (v: boolean | null) => void;
+}) {
+  const state = folderFlagState(marked, total);
+  const m = marked ?? 0;
+  const t = total ?? 0;
+  return (
+    <div className="form-row">
+      <label>
+        <input
+          type="checkbox"
+          ref={(el) => {
+            if (el) el.indeterminate = state === "some";
+          }}
+          checked={state === "all"}
+          disabled={t === 0}
+          onChange={(e) => onSet(e.target.checked ? true : null)}
+        />{" "}
+        {label}{" "}
+        <span className="muted" style={{ fontSize: 11 }}>
+          ({m.toLocaleString()}/{t.toLocaleString()} files
+          {scoped ? ", matching only" : ""})
+        </span>
+        {state === "some" && (
+          <span
+            className="inherited"
+            title="Irregular: this folder is partially marked — some files are not."
+          >
+            {" "}
+            ⚠ mixed
+          </span>
+        )}
+      </label>
+    </div>
+  );
+}
+
+function FileFlag({
+  label,
+  checked,
+  inherited,
+  onSet,
+  onClear,
+}: {
+  label: string;
+  checked: boolean;
+  inherited: boolean;
+  onSet: (v: boolean) => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="form-row">
+      <label>
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onSet(e.target.checked)}
+        />{" "}
+        {label}{" "}
+        {inherited && (
+          <span className="inherited">
+            (inherited){" "}
+            <button
+              style={{ padding: "0 6px", fontSize: 11 }}
+              onClick={onClear}
+              title="Clear this node's own value (revert to inheriting)"
+            >
+              clear
+            </button>
+          </span>
+        )}
+      </label>
+    </div>
+  );
+}
+
 function ScopedFolderEdit({
   matchCount,
   onApply,
@@ -275,54 +387,13 @@ function ScopedFolderEdit({
   return (
     <div>
       <div className="muted" style={{ marginBottom: 10, fontSize: 11 }}>
-        A filter is active, so changes here apply <b>recursively to the{" "}
+        A filter is active, so the fields below apply <b>recursively to the{" "}
         {n.toLocaleString()} matching file(s)</b> in this subtree only. Other file
         types (and the folder itself) are left unchanged.
       </div>
-      <FlagButtons
-        label="Keep?"
-        n={n}
-        onSet={(v) => onApply({ keep: v })}
-      />
-      <FlagButtons
-        label="Processed?"
-        n={n}
-        onSet={(v) => onApply({ processed: v })}
-      />
       <ScopedText label="Target location" n={n} onApply={(v) => onApply({ target_location: v || null })} />
       <ScopedText label="JIRA ticket" n={n} onApply={(v) => onApply({ jira_ticket: v || null })} />
       <ScopedText label="Comment" n={n} onApply={(v) => onApply({ comment: v || null })} />
-    </div>
-  );
-}
-
-function FlagButtons({
-  label,
-  n,
-  onSet,
-}: {
-  label: string;
-  n: number;
-  onSet: (v: boolean | null) => void;
-}) {
-  return (
-    <div className="form-row">
-      <label>{label}</label>
-      <div style={{ display: "flex", gap: 6 }}>
-        <button className="primary" disabled={!n} onClick={() => onSet(true)}>
-          Set ✓ on {n.toLocaleString()}
-        </button>
-        <button disabled={!n} onClick={() => onSet(false)}>
-          Set ✗
-        </button>
-        <button
-          disabled={!n}
-          onClick={() => onSet(null)}
-          title="Clear the flag on matching files (revert to inheriting)"
-        >
-          Clear
-        </button>
-      </div>
     </div>
   );
 }
