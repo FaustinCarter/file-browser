@@ -102,14 +102,25 @@ if os.path.isdir(_STATIC_DIR):
         name="assets",
     )
 
+    def _index() -> FileResponse:
+        # The shell points at content-hashed assets, so it must always be
+        # revalidated — otherwise a rebuild's new UI is masked by a cached
+        # index.html still referencing the old bundle.
+        return FileResponse(
+            os.path.join(_STATIC_DIR, "index.html"),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
+
     @app.get("/")
     def index():
-        return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
+        return _index()
 
     # SPA fallback for any non-API route.
     @app.get("/{full_path:path}")
     def spa(full_path: str):
         candidate = os.path.join(_STATIC_DIR, full_path)
-        if os.path.isfile(candidate):
+        if os.path.isfile(candidate) and os.path.abspath(candidate).startswith(
+            os.path.abspath(_STATIC_DIR)
+        ):
             return FileResponse(candidate)
-        return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
+        return _index()
