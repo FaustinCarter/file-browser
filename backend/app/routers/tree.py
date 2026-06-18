@@ -25,6 +25,8 @@ def children(
     accessed_before: date | None = Query(None),
     no_transfer: str | None = Query(None, description="'yes' (only marked) / 'no' (hide marked)"),
     processed: str | None = Query(None, description="'yes' (only marked) / 'no' (hide marked)"),
+    jira: str | None = Query(None, description="effective JIRA value, or '__none__' for unassigned"),
+    assignee: str | None = Query(None, description="effective assignee, or '__none__' for unassigned"),
     db: Session = Depends(get_db),
 ):
     """Direct children of ``parent_id`` (or dataset roots when parent_id is None).
@@ -39,6 +41,7 @@ def children(
     f = services.build_filters(
         db, dataset_id, types=types, accessed_after=accessed_after,
         accessed_before=accessed_before, no_transfer=no_transfer, processed=processed,
+        jira=jira, assignee=assignee,
     )
 
     parent_cond = (

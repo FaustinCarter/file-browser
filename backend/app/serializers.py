@@ -71,6 +71,8 @@ def build_node_outs(
             effective=EffectiveAnnotation(**eff),
             own=EffectiveAnnotation(**own),
             inherited_fields=inherited,
+            updated_at=info["updated_at"],
+            updated_by=info["updated_by"],
         )
         if n.is_dir and with_folder_stats:
             m = services.folder_metrics(

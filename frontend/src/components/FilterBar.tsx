@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, Filters } from "../api";
+import { api, Filters, UNASSIGNED } from "../api";
 
 interface Props {
   datasetId: number;
@@ -9,13 +9,17 @@ interface Props {
 
 export default function FilterBar({ datasetId, filters, onChange }: Props) {
   const [types, setTypes] = useState<{ file_type: string; count: number }[]>([]);
+  const [jiraVals, setJiraVals] = useState<string[]>([]);
+  const [assigneeVals, setAssigneeVals] = useState<string[]>([]);
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     api.fileTypes(datasetId).then(setTypes).catch(() => setTypes([]));
-  }, [datasetId]);
+    api.distinctValues(datasetId, "jira_ticket").then((r) => setJiraVals(r.values)).catch(() => {});
+    api.distinctValues(datasetId, "assignee").then((r) => setAssigneeVals(r.values)).catch(() => {});
+  }, [datasetId, filters]);
 
   useEffect(() => {
     const h = (e: MouseEvent) => {
@@ -131,11 +135,44 @@ export default function FilterBar({ datasetId, filters, onChange }: Props) {
         </select>
       </div>
 
+      <div className="filter-group">
+        <label>Assignee</label>
+        <select
+          value={filters.assignee || ""}
+          onChange={(e) =>
+            onChange({ ...filters, assignee: e.target.value || undefined })
+          }
+        >
+          <option value="">Any</option>
+          <option value={UNASSIGNED}>Unassigned</option>
+          {assigneeVals.map((v) => (
+            <option key={v} value={v}>{v}</option>
+          ))}
+        </select>
+      </div>
+      <div className="filter-group">
+        <label>JIRA</label>
+        <select
+          value={filters.jira || ""}
+          onChange={(e) =>
+            onChange({ ...filters, jira: e.target.value || undefined })
+          }
+        >
+          <option value="">Any</option>
+          <option value={UNASSIGNED}>No ticket</option>
+          {jiraVals.map((v) => (
+            <option key={v} value={v}>{v}</option>
+          ))}
+        </select>
+      </div>
+
       {(selected.size > 0 ||
         filters.accessed_after ||
         filters.accessed_before ||
         filters.no_transfer ||
-        filters.processed) && (
+        filters.processed ||
+        filters.jira ||
+        filters.assignee) && (
         <div className="filter-group">
           <label>&nbsp;</label>
           <button

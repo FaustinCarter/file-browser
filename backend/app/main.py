@@ -30,22 +30,39 @@ def _init_schema():
     with engine.begin() as conn:
         if is_pg:
             conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _SCHEMA_LOCK_KEY})
-            has_keep = conn.execute(
-                text(
-                    "SELECT 1 FROM information_schema.columns "
-                    "WHERE table_name='annotations' AND column_name='keep'"
+
+            def col(name: str) -> bool:
+                return bool(
+                    conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_name='annotations' AND column_name=:c"
+                        ),
+                        {"c": name},
+                    ).first()
                 )
-            ).first()
-            has_new = conn.execute(
-                text(
-                    "SELECT 1 FROM information_schema.columns "
-                    "WHERE table_name='annotations' AND column_name='no_transfer'"
-                )
-            ).first()
-            if has_keep and not has_new:
-                conn.execute(
-                    text("ALTER TABLE annotations RENAME COLUMN keep TO no_transfer")
-                )
+
+            table_exists = col("node_id")
+            if table_exists:
+                # keep -> no_transfer
+                if col("keep") and not col("no_transfer"):
+                    conn.execute(
+                        text("ALTER TABLE annotations RENAME COLUMN keep TO no_transfer")
+                    )
+                # user_name (auto-stamped editor) -> updated_by audit field
+                if col("user_name") and not col("updated_by"):
+                    conn.execute(
+                        text("ALTER TABLE annotations RENAME COLUMN user_name TO updated_by")
+                    )
+                # new editable assignee column
+                if not col("assignee"):
+                    conn.execute(text("ALTER TABLE annotations ADD COLUMN assignee text"))
+                    conn.execute(
+                        text(
+                            "CREATE INDEX IF NOT EXISTS ix_annotations_assignee "
+                            "ON annotations (dataset_id, assignee)"
+                        )
+                    )
         # create_all is a no-op for existing tables; runs inside the same lock.
         Base.metadata.create_all(bind=conn)
 

@@ -5,7 +5,8 @@ millions of files ahead of a file-server migration. You feed it the CSV exports
 produced by a Windows disk-usage tool (TreeSize-style, one row per filesystem
 object) and get an interactive tree explorer, a filterable grid, recursive
 type/size analytics, and editable migration metadata (No-Transfer/Processed flags,
-target location, JIRA ticket, comments) — all shared by your whole team.
+assignee, target location, JIRA ticket, comments) — all shared by your whole team.
+Every change records who touched it and when.
 
 ---
 
@@ -44,7 +45,7 @@ docker compose up --build
 ```
 
 Then open <http://localhost:8000>. On first visit you'll be asked for a display
-name (used to stamp the `user name` column on your edits — see
+name (recorded as `Updated by` on your edits — see
 [Identity](#identity)). Click **+ Upload CSV** and select an export to begin.
 
 A ready-made test dataset lives at `sample_data/fake_fileserver.csv`
@@ -157,17 +158,23 @@ into sortable numeric values while the original strings are kept for display.
   folder stays indeterminate until every file is marked.
 - *Hide what you've handled* — filter the tree or grid by No-Transfer/Processed
   to drop marked rows (and fully-marked folders) from view.
-- *Target location, JIRA ticket, comment, user* — editable columns; bulk-edit by
-  selection (grid) or by filtered subtree (detail panel's "Bulk stamp").
+- *Assignee, target location, JIRA ticket, comment* — editable columns; bulk-edit
+  by selection (grid) or by filtered subtree (detail panel's "Bulk stamp"). Assign
+  a folder (inherited by its files) or a filtered set of files to a person.
+- *Filter by JIRA ticket or Assignee (incl. unassigned)* — dropdowns in the tree
+  filter bar and the grid match the **effective** value (own or inherited), with
+  an "Unassigned" / "No ticket" option.
+- *Who/when audit* — each annotation records `Updated by` and `Updated at`
+  automatically (NULL until first touched); shown in the detail panel and grid.
 
 ---
 
 ## Identity
 
 Access is open (pick-a-name): on first load each user enters a display name,
-stored in their browser and automatically attached to the `user name` column on
-their edits. There is no login wall — put the container behind your own reverse
-proxy / SSO if you need access control.
+stored in their browser and sent as the `X-Actor` header so every edit records
+who made it (`Updated by`). There is no login wall — put the container behind
+your own reverse proxy / SSO if you need access control.
 
 ---
 

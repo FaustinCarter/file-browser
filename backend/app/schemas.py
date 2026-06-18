@@ -22,7 +22,7 @@ class EffectiveAnnotation(BaseModel):
     target_location: str | None = None
     jira_ticket: str | None = None
     comment: str | None = None
-    user_name: str | None = None
+    assignee: str | None = None
 
 
 class NodeOut(BaseModel):
@@ -61,6 +61,10 @@ class NodeOut(BaseModel):
     no_transfer_marked: int | None = None
     processed_marked: int | None = None
 
+    # audit (the node's own last-touched info; null until first touched)
+    updated_at: datetime | None = None
+    updated_by: str | None = None
+
 
 class TreeChildrenOut(BaseModel):
     parent_id: int | None
@@ -90,7 +94,7 @@ class AnnotationUpdate(BaseModel):
     target_location: str | None = None
     jira_ticket: str | None = None
     comment: str | None = None
-    user_name: str | None = None
+    assignee: str | None = None
 
 
 class FolderFlagUpdate(BaseModel):

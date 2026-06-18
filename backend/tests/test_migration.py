@@ -21,7 +21,10 @@ def _make_old_schema():
             )
         )
         c.execute(
-            text("INSERT INTO annotations (node_id, dataset_id, keep) VALUES (1, 1, true)")
+            text(
+                "INSERT INTO annotations (node_id, dataset_id, keep, user_name) "
+                "VALUES (1, 1, true, 'alice')"
+            )
         )
 
 
@@ -36,11 +39,15 @@ def _assert_migrated():
                 )
             )
         ]
-        val = c.execute(
-            text("SELECT no_transfer FROM annotations WHERE node_id=1")
-        ).scalar()
+        row = c.execute(
+            text("SELECT no_transfer, updated_by FROM annotations WHERE node_id=1")
+        ).one()
+    # keep -> no_transfer, user_name -> updated_by, assignee added.
     assert "no_transfer" in cols and "keep" not in cols
-    assert val is True  # data preserved
+    assert "updated_by" in cols and "user_name" not in cols
+    assert "assignee" in cols
+    assert row[0] is True  # no_transfer value preserved
+    assert row[1] == "alice"  # user_name value preserved as updated_by
 
 
 def test_keep_renamed_and_data_preserved():

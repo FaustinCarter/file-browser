@@ -3,13 +3,13 @@ from __future__ import annotations
 
 from datetime import date
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, func, not_, select
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
 from .. import services
 from ..database import get_db
-from ..models import Annotation, Node
+from ..models import Node
 from ..schemas import (
     AnnotationUpdate,
     BulkAnnotationUpdate,
@@ -43,7 +43,8 @@ def search(
     types: list[str] | None = Query(None),
     owner: str | None = Query(None),
     is_dir: bool | None = Query(None),
-    jira: str | None = Query(None),
+    jira: str | None = Query(None, description="effective JIRA value, or '__none__' for unassigned"),
+    assignee: str | None = Query(None, description="effective assignee, or '__none__' for unassigned"),
     processed: str | None = Query(None, description="'yes' (marked) / 'no' (unmarked)"),
     no_transfer: str | None = Query(None, description="'yes' (marked) / 'no' (unmarked)"),
     accessed_after: date | None = Query(None),
@@ -57,11 +58,13 @@ def search(
 ):
     """Flat, paginated, filterable grid view across the dataset.
 
-    The processed / no_transfer filters match a node's **effective** value
-    (own or inherited from a parent folder). The jira filter matches own values.
+    The processed / no_transfer / jira / assignee filters match a node's
+    **effective** value (own or inherited from a parent folder). ``owner`` filters
+    the read-only file-system owner from the CSV.
     """
     f = services.build_filters(
         db, dataset_id, no_transfer=no_transfer, processed=processed,
+        jira=jira, assignee=assignee,
     )
     conds = [Node.dataset_id == dataset_id]
     if q:
@@ -81,21 +84,10 @@ def search(
         if not parent:
             raise HTTPException(status_code=404, detail="under_node_id not found")
         conds.append(Node.mat_path.like(f"{parent.mat_path}%"))
-    if no_transfer == "yes":
-        conds.append(f["nt_clause"])
-    elif no_transfer == "no":
-        conds.append(not_(f["nt_clause"]))
-    if processed == "yes":
-        conds.append(f["proc_clause"])
-    elif processed == "no":
-        conds.append(not_(f["proc_clause"]))
+    if f["view_filter"] is not None:
+        conds.append(f["view_filter"])
 
-    stmt = select(Node)
-    if jira is not None:
-        stmt = stmt.join(Annotation, Annotation.node_id == Node.id)
-        conds.append(Annotation.jira_ticket == jira)
-
-    stmt = stmt.where(and_(*conds))
+    stmt = select(Node).where(and_(*conds))
 
     total = db.execute(
         select(func.count()).select_from(stmt.subquery())
@@ -195,21 +187,29 @@ def type_breakdown(
 
 @router.patch("/{node_id}/annotation", response_model=NodeOut)
 def update_annotation(
-    node_id: int, payload: AnnotationUpdate, db: Session = Depends(get_db)
+    node_id: int,
+    payload: AnnotationUpdate,
+    actor: str | None = Header(default=None, alias="X-Actor"),
+    db: Session = Depends(get_db),
 ):
     node = db.get(Node, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
     # Only apply fields the client actually sent (so we can clear vs ignore).
     values = payload.model_dump(exclude_unset=True)
-    services.upsert_annotation(db, node, values)
+    services.upsert_annotation(db, node, values, actor=actor)
     db.commit()
     db.refresh(node)
     return _single_node_out(db, node)
 
 
 @router.post("/{node_id}/folder-flag", response_model=NodeOut)
-def folder_flag(node_id: int, payload: FolderFlagUpdate, db: Session = Depends(get_db)):
+def folder_flag(
+    node_id: int,
+    payload: FolderFlagUpdate,
+    actor: str | None = Header(default=None, alias="X-Actor"),
+    db: Session = Depends(get_db),
+):
     """Set/clear a rollup boolean (no_transfer/processed) on a folder.
 
     No filter -> the whole subtree: clear any descendant overrides, then set the
@@ -233,27 +233,31 @@ def folder_flag(node_id: int, payload: FolderFlagUpdate, db: Session = Depends(g
             services.clear_field_under(
                 db, node, field, include_self=False, files_only=True,
                 types=payload.types, accessed_after=payload.accessed_after,
-                accessed_before=payload.accessed_before,
+                accessed_before=payload.accessed_before, actor=actor,
             )
         else:
             services.bulk_set_under(
                 db, node, {field: payload.value}, include_self=False,
                 files_only=True, types=payload.types,
                 accessed_after=payload.accessed_after,
-                accessed_before=payload.accessed_before,
+                accessed_before=payload.accessed_before, actor=actor,
             )
     else:
         # Whole subtree: wipe descendant overrides so the folder's value governs.
-        services.clear_field_under(db, node, field, include_self=True)
+        services.clear_field_under(db, node, field, include_self=True, actor=actor)
         if payload.value is not None:
-            services.upsert_annotation(db, node, {field: payload.value})
+            services.upsert_annotation(db, node, {field: payload.value}, actor=actor)
     db.commit()
     db.refresh(node)
     return _single_node_out(db, node)
 
 
 @router.post("/bulk-annotation")
-def bulk_annotation(payload: BulkAnnotationUpdate, db: Session = Depends(get_db)):
+def bulk_annotation(
+    payload: BulkAnnotationUpdate,
+    actor: str | None = Header(default=None, alias="X-Actor"),
+    db: Session = Depends(get_db),
+):
     node = db.get(Node, payload.node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
@@ -267,6 +271,7 @@ def bulk_annotation(payload: BulkAnnotationUpdate, db: Session = Depends(get_db)
         types=payload.types,
         accessed_after=payload.accessed_after,
         accessed_before=payload.accessed_before,
+        actor=actor,
     )
     db.commit()
     return {"updated": count}

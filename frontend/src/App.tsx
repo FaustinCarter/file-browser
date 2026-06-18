@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, Dataset, Filters, NodeOut } from "./api";
+import { api, setActor, Dataset, Filters, NodeOut } from "./api";
 import FilterBar from "./components/FilterBar";
 import TreeView from "./components/TreeView";
 import DetailPanel from "./components/DetailPanel";
@@ -31,6 +31,11 @@ export default function App() {
   useEffect(() => {
     refreshDatasets();
   }, []);
+
+  // Keep the audit actor in sync with the chosen display name.
+  useEffect(() => {
+    setActor(userName);
+  }, [userName]);
 
   // Reset selection/filters/expansion when switching datasets.
   useEffect(() => {
@@ -155,7 +160,6 @@ export default function App() {
               <DetailPanel
                 key={selected.id}
                 nodeId={selected.id}
-                userName={userName}
                 filters={filters}
                 onMutated={() => setRefreshKey((k) => k + 1)}
                 toast={toast}
@@ -169,7 +173,7 @@ export default function App() {
         </div>
       ) : (
         <div className="left" style={{ flex: 1, borderRight: "none" }}>
-          <GridView datasetId={current} userName={userName} toast={toast} />
+          <GridView datasetId={current} toast={toast} />
         </div>
       )}
 

@@ -252,6 +252,91 @@ def test_tree_hide_marked_drops_fully_marked_folder(client, loaded):
     assert "Reports" in names
 
 
+def test_audit_fields_set_on_edit(client, loaded):
+    ds = loaded
+    deck = _find(client, ds["id"], "deck.pptx")
+    # Untouched -> audit is null.
+    before = client.get(f"/api/nodes/{deck['id']}").json()
+    assert before["updated_at"] is None and before["updated_by"] is None
+
+    # Edit with an actor header -> updated_by/updated_at populated.
+    client.patch(
+        f"/api/nodes/{deck['id']}/annotation",
+        json={"comment": "looked at it"},
+        headers={"X-Actor": "carol"},
+    )
+    after = client.get(f"/api/nodes/{deck['id']}").json()
+    assert after["updated_by"] == "carol"
+    assert after["updated_at"] is not None
+
+
+def test_assignee_inheritance_and_filter(client, loaded):
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    deck = _find(client, ds["id"], "deck.pptx")
+    a_jpg = _find(client, ds["id"], "a.jpg")  # under Images, not Reports
+
+    # Assign the Reports folder to dave -> children inherit.
+    client.patch(
+        f"/api/nodes/{reports['id']}/annotation",
+        json={"assignee": "dave"}, headers={"X-Actor": "dave"},
+    )
+    deck_v = client.get(f"/api/nodes/{deck['id']}").json()
+    assert deck_v["effective"]["assignee"] == "dave"
+    assert "assignee" in deck_v["inherited_fields"]
+
+    # Filter the grid by effective assignee=dave -> Reports subtree only.
+    g = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "is_dir": False, "assignee": "dave"},
+    ).json()
+    names = {i["name"] for i in g["items"]}
+    assert {"deck.pptx", "notes.pptx", "data.xlsx"} <= names
+    assert a_jpg["name"] not in names
+
+    # Filter for unassigned -> the Images files (no assignee).
+    ug = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "is_dir": False, "assignee": "__none__"},
+    ).json()
+    un = {i["name"] for i in ug["items"]}
+    assert {"a.jpg", "b.png"} <= un
+    assert "deck.pptx" not in un
+
+
+def test_jira_filter_value_and_unassigned(client, loaded):
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    client.post(
+        "/api/nodes/bulk-annotation",
+        json={"node_id": reports["id"], "files_only": True, "types": ["PPTX File"],
+              "values": {"jira_ticket": "MIG-7"}},
+        headers={"X-Actor": "bob"},
+    )
+    hit = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "is_dir": False, "jira": "MIG-7"},
+    ).json()
+    assert hit["total"] == 2  # the 2 PPTX
+
+    none = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "is_dir": False, "jira": "__none__"},
+    ).json()
+    names = {i["name"] for i in none["items"]}
+    assert "deck.pptx" not in names and "a.jpg" in names
+
+
+def test_distinct_values_endpoint(client, loaded):
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    client.patch(f"/api/nodes/{reports['id']}/annotation", json={"assignee": "dave"})
+    images = _find(client, ds["id"], "Images")
+    client.patch(f"/api/nodes/{images['id']}/annotation", json={"assignee": "erin"})
+    r = client.get(f"/api/datasets/{ds['id']}/distinct/assignee").json()
+    assert r["values"] == ["dave", "erin"]
+
+
 def test_search_filters_and_pagination(client, loaded):
     ds = loaded
     r = client.get(

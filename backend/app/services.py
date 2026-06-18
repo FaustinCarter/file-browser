@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from datetime import date
 
+from datetime import datetime, timezone
+
 from sqlalchemy import (
     Select,
     and_,
@@ -12,46 +14,43 @@ from sqlalchemy import (
     not_,
     or_,
     select,
+    true as sa_true,
     update,
 )
 from sqlalchemy.orm import Session
 
 from .models import Annotation, Node
 
+# Editable, inheritable annotation fields.
 ANNOTATION_FIELDS = (
     "processed",
     "no_transfer",
     "target_location",
     "jira_ticket",
     "comment",
-    "user_name",
+    "assignee",
 )
 
 # Booleans that use the folder rollup / hide-filter behaviour.
 BOOLEAN_FLAG_FIELDS = ("processed", "no_transfer")
 
+# Sentinel meaning "filter to records with no effective value for this field".
+UNASSIGNED = "__none__"
 
-def effective_true_clause(db: Session, dataset_id: int, field: str):
-    """A SQL boolean expression that is true for nodes whose *effective* value of
-    ``field`` is True (own value, else nearest ancestor's).
 
-    Implemented purely from the (sparse) set of override nodes, so it's a plain
-    expression over ``Node.mat_path`` — no per-row subquery or recursive CTE.
-    Each override contributes its subtree minus the subtrees of its nearest
-    descendant overrides, so the total number of LIKE terms is O(overrides).
-    """
+def _override_paths(db: Session, dataset_id: int, field: str):
+    """Return ``[(mat_path, value), ...]`` for every node that sets ``field``."""
     col = getattr(Annotation, field)
-    rows = db.execute(
+    return db.execute(
         select(Node.mat_path, col)
         .join(Annotation, Annotation.node_id == Node.id)
         .where(Annotation.dataset_id == dataset_id, col.isnot(None))
     ).all()
-    if not rows:
-        return sa_false()
 
-    value_by_path = {mp: bool(v) for mp, v in rows}
-    paths = sorted(value_by_path)
-    # Build the override forest to find each override's direct child overrides.
+
+def _direct_children(paths: list[str]) -> dict[str, list[str]]:
+    """Map each override path to its nearest descendant override paths."""
+    paths = sorted(paths)
     direct: dict[str, list[str]] = {p: [] for p in paths}
     stack: list[str] = []
     for p in paths:
@@ -60,17 +59,46 @@ def effective_true_clause(db: Session, dataset_id: int, field: str):
         if stack:
             direct[stack[-1]].append(p)
         stack.append(p)
+    return direct
 
+
+def effective_equals_clause(db: Session, dataset_id: int, field: str, value):
+    """SQL expression: true for nodes whose *effective* ``field`` equals ``value``.
+
+    Built from the sparse override set as an O(overrides) materialized-path
+    expression (no per-row subquery / recursive CTE). Each matching override
+    contributes its subtree minus the subtrees of its nearest descendant
+    overrides (which are governed by a deeper value).
+    """
+    rows = _override_paths(db, dataset_id, field)
+    if not rows:
+        return sa_false()
+    direct = _direct_children([mp for mp, _ in rows])
     clauses = []
-    for p in paths:
-        if not value_by_path[p]:
-            continue  # a False override governs its region; contributes nothing
-        region = Node.mat_path.like(p + "%")
-        kids = direct[p]
+    for mp, v in rows:
+        if v != value:
+            continue
+        region = Node.mat_path.like(mp + "%")
+        kids = direct.get(mp, [])
         if kids:
             region = and_(region, not_(or_(*[Node.mat_path.like(k + "%") for k in kids])))
         clauses.append(region)
     return or_(*clauses) if clauses else sa_false()
+
+
+def effective_isnull_clause(db: Session, dataset_id: int, field: str):
+    """SQL expression: true for nodes with no effective value for ``field``."""
+    rows = _override_paths(db, dataset_id, field)
+    if not rows:
+        return sa_true()  # nothing sets it -> everything is unassigned
+    # A node has *some* value iff it sits under any override path.
+    has_value = or_(*[Node.mat_path.like(mp + "%") for mp, _ in rows])
+    return not_(has_value)
+
+
+def effective_true_clause(db: Session, dataset_id: int, field: str):
+    """Effective value is boolean True (used by the rollups / hide filters)."""
+    return effective_equals_clause(db, dataset_id, field, True)
 
 
 def ancestor_ids_self_first(mat_path: str) -> list[int]:
@@ -119,7 +147,14 @@ def resolve_effective(db: Session, nodes: list[Node]) -> dict[int, dict]:
             if own_ann
             else {f: None for f in ANNOTATION_FIELDS}
         )
-        out[n.id] = {"effective": eff, "source": src, "own": own}
+        out[n.id] = {
+            "effective": eff,
+            "source": src,
+            "own": own,
+            # Audit: the node's own last-touched info (None if never touched).
+            "updated_at": own_ann.updated_at if own_ann else None,
+            "updated_by": own_ann.updated_by if own_ann else None,
+        }
     return out
 
 
@@ -174,14 +209,18 @@ def build_filters(
     accessed_before: date | None = None,
     no_transfer: str | None = None,
     processed: str | None = None,
+    jira: str | None = None,
+    assignee: str | None = None,
 ) -> dict:
     """Translate request filter params into reusable SQL clauses.
 
     ``no_transfer`` / ``processed`` are tri-state: None (any), "yes" (show only
-    effectively-marked), or "no" (hide effectively-marked). The returned
-    ``view_filter`` combines every active filter; ``nt_clause`` / ``proc_clause``
-    are the raw effective-true expressions (used for folder rollups regardless of
-    whether a filter is active).
+    effectively-marked), or "no" (hide effectively-marked). ``jira`` / ``assignee``
+    filter on the *effective* value: a specific string matches that value, the
+    ``UNASSIGNED`` sentinel ("__none__") matches records with no effective value.
+    The returned ``view_filter`` combines every active filter; ``nt_clause`` /
+    ``proc_clause`` are the raw effective-true expressions (used for folder
+    rollups regardless of whether a filter is active).
     """
     nt_clause = effective_true_clause(db, dataset_id, "no_transfer")
     proc_clause = effective_true_clause(db, dataset_id, "processed")
@@ -200,12 +239,38 @@ def build_filters(
         conds.append(proc_clause)
     elif processed == "no":
         conds.append(not_(proc_clause))
+
+    def value_filter(field: str, value: str | None):
+        if not value:
+            return
+        if value == UNASSIGNED:
+            conds.append(effective_isnull_clause(db, dataset_id, field))
+        else:
+            conds.append(effective_equals_clause(db, dataset_id, field, value))
+
+    value_filter("jira_ticket", jira)
+    value_filter("assignee", assignee)
+
     return {
         "view_filter": and_(*conds) if conds else None,
         "nt_clause": nt_clause,
         "proc_clause": proc_clause,
         "filter_active": bool(conds),
     }
+
+
+def distinct_values(db: Session, dataset_id: int, field: str) -> list[str]:
+    """Distinct non-null values assigned for ``field`` (for filter dropdowns)."""
+    if field not in ANNOTATION_FIELDS:
+        return []
+    col = getattr(Annotation, field)
+    rows = db.execute(
+        select(col)
+        .where(Annotation.dataset_id == dataset_id, col.isnot(None))
+        .distinct()
+        .order_by(col)
+    ).all()
+    return [r[0] for r in rows]
 
 
 def folder_metrics(
@@ -300,7 +365,15 @@ def get_node(db: Session, node_id: int) -> Node | None:
     return db.get(Node, node_id)
 
 
-def upsert_annotation(db: Session, node: Node, values: dict) -> Annotation:
+def _stamp(ann: Annotation, actor: str | None) -> None:
+    """Record who touched this annotation and when (server time)."""
+    ann.updated_by = actor
+    ann.updated_at = func.now()
+
+
+def upsert_annotation(
+    db: Session, node: Node, values: dict, *, actor: str | None = None
+) -> Annotation:
     """Set override values on a node (None clears -> inherit again).
 
     Only keys present in ``values`` are touched, so a partial update leaves other
@@ -313,6 +386,7 @@ def upsert_annotation(db: Session, node: Node, values: dict) -> Annotation:
     for k, v in values.items():
         if k in ANNOTATION_FIELDS:
             setattr(ann, k, v)
+    _stamp(ann, actor)
     db.flush()
     return ann
 
@@ -327,6 +401,7 @@ def clear_field_under(
     types: list[str] | None = None,
     accessed_after: date | None = None,
     accessed_before: date | None = None,
+    actor: str | None = None,
 ) -> int:
     """Null out ``field`` on existing annotations within ``folder``'s subtree.
 
@@ -347,7 +422,7 @@ def clear_field_under(
     result = db.execute(
         update(Annotation)
         .where(Annotation.node_id.in_(subq))
-        .values(**{field: None})
+        .values(**{field: None, "updated_by": actor, "updated_at": func.now()})
     )
     db.flush()
     return result.rowcount or 0
@@ -363,6 +438,7 @@ def bulk_set_under(
     accessed_after: date | None = None,
     accessed_before: date | None = None,
     files_only: bool = False,
+    actor: str | None = None,
 ) -> int:
     """Write override values onto every node under ``folder`` matching filters.
 
@@ -403,5 +479,6 @@ def bulk_set_under(
             db.add(ann)
         for k, v in clean.items():
             setattr(ann, k, v)
+        _stamp(ann, actor)
     db.flush()
     return len(node_ids)

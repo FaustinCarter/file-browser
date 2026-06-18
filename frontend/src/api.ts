@@ -14,10 +14,22 @@ export interface Annotation {
   target_location: string | null;
   jira_ticket: string | null;
   comment: string | null;
-  user_name: string | null;
+  assignee: string | null;
 }
 
 export type FlagField = "no_transfer" | "processed";
+
+// Filter sentinel: records with no effective value for a field.
+export const UNASSIGNED = "__none__";
+
+// Display name of the current user, sent as X-Actor on mutations for audit.
+let _actor = "";
+export function setActor(name: string) {
+  _actor = name;
+}
+function jsonHeaders(): Record<string, string> {
+  return { "Content-Type": "application/json", "X-Actor": _actor };
+}
 
 export interface NodeOut {
   id: number;
@@ -49,6 +61,8 @@ export interface NodeOut {
   total_files: number | null;
   no_transfer_marked: number | null;
   processed_marked: number | null;
+  updated_at: string | null;
+  updated_by: string | null;
 }
 
 export interface Filters {
@@ -58,6 +72,9 @@ export interface Filters {
   // tri-state flag filters: undefined (any) | "yes" (only marked) | "no" (hide marked)
   no_transfer?: "yes" | "no";
   processed?: "yes" | "no";
+  // value filters: undefined (any) | a value | UNASSIGNED ("__none__")
+  jira?: string;
+  assignee?: string;
 }
 
 // Tri-state rollup of a folder's descendant files for a boolean flag.
@@ -124,8 +141,15 @@ export const api = {
         accessed_before: filters.accessed_before,
         no_transfer: filters.no_transfer,
         processed: filters.processed,
+        jira: filters.jira,
+        assignee: filters.assignee,
       })}`,
     ).then((r) => j<{ parent_id: number | null; children: NodeOut[] }>(r)),
+
+  distinctValues: (datasetId: number, field: "jira_ticket" | "assignee") =>
+    fetch(`/api/datasets/${datasetId}/distinct/${field}`).then((r) =>
+      j<{ values: string[] }>(r),
+    ),
 
   folderFlag: (
     nodeId: number,
@@ -139,7 +163,7 @@ export const api = {
   ) =>
     fetch(`/api/nodes/${nodeId}/folder-flag`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: jsonHeaders(),
       body: JSON.stringify(payload),
     }).then((r) => j<NodeOut>(r)),
 
@@ -191,7 +215,7 @@ export const api = {
   updateAnnotation: (id: number, values: Partial<Annotation>) =>
     fetch(`/api/nodes/${id}/annotation`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
+      headers: jsonHeaders(),
       body: JSON.stringify(values),
     }).then((r) => j<NodeOut>(r)),
 
@@ -206,7 +230,7 @@ export const api = {
   }) =>
     fetch("/api/nodes/bulk-annotation", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: jsonHeaders(),
       body: JSON.stringify(payload),
     }).then((r) => j<{ updated: number }>(r)),
 };

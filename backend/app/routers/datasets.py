@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
-from .. import csv_import
+from .. import csv_import, services
 from ..database import get_db
 from ..models import Annotation, Dataset, Node
 from ..schemas import DatasetOut
@@ -45,6 +45,14 @@ def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     db.delete(ds)
     db.commit()
     return {"deleted": dataset_id}
+
+
+@router.get("/{dataset_id}/distinct/{field}")
+def distinct_values(dataset_id: int, field: str, db: Session = Depends(get_db)):
+    """Distinct assigned values for an editable field (filter dropdowns)."""
+    if not db.get(Dataset, dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return {"values": services.distinct_values(db, dataset_id, field)}
 
 
 @router.get("/{dataset_id}/file-types")

@@ -16,22 +16,20 @@ const FLAGS: { field: FlagField; label: string }[] = [
 
 interface Props {
   nodeId: number;
-  userName: string;
   filters: Filters;
   onMutated: () => void;
   toast: (msg: string, err?: boolean) => void;
 }
 
 const EDIT_FIELDS: { key: keyof Annotation; label: string }[] = [
+  { key: "assignee", label: "Assignee" },
   { key: "target_location", label: "Target location" },
   { key: "jira_ticket", label: "JIRA ticket" },
   { key: "comment", label: "Comment" },
-  { key: "user_name", label: "User name" },
 ];
 
 export default function DetailPanel({
   nodeId,
-  userName,
   filters,
   onMutated,
   toast,
@@ -76,8 +74,6 @@ export default function DetailPanel({
   const inh = new Set(node.inherited_fields);
 
   async function save(values: Partial<Annotation>) {
-    // Stamp the editor's name unless they're explicitly editing user_name.
-    if (!("user_name" in values) && userName) values.user_name = userName;
     try {
       const updated = await api.updateAnnotation(nodeId, values);
       setNode(updated);
@@ -91,7 +87,6 @@ export default function DetailPanel({
   // Folder edit while a filter is active: stamp only the matching files in the
   // subtree (recursively), leaving other types and the folder itself untouched.
   async function applyScoped(values: Partial<Annotation>) {
-    if (userName) values.user_name = userName;
     try {
       const r = await api.bulkAnnotation({
         node_id: nodeId,
@@ -229,13 +224,19 @@ export default function DetailPanel({
             ))}
           </>
         )}
+        <div className="muted" style={{ fontSize: 11, marginTop: 8 }}>
+          {node.updated_at
+            ? `Last updated by ${node.updated_by || "—"} · ${new Date(
+                node.updated_at,
+              ).toLocaleString()}`
+            : "Never edited"}
+        </div>
       </div>
 
       {node.is_dir && !filterActive && (
         <BulkStamp
           node={node}
           filters={filters}
-          userName={userName}
           onDone={(n) => {
             toast(`Stamped ${n} nodes`);
             onMutated();
@@ -424,17 +425,16 @@ function ScopedText({
 function BulkStamp({
   node,
   filters,
-  userName,
   onDone,
   toast,
 }: {
   node: NodeOut;
   filters: Filters;
-  userName: string;
   onDone: (n: number) => void;
   toast: (m: string, e?: boolean) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [assignee, setAssignee] = useState("");
   const [jira, setJira] = useState("");
   const [target, setTarget] = useState("");
   const [comment, setComment] = useState("");
@@ -444,10 +444,10 @@ function BulkStamp({
 
   async function apply() {
     const values: Partial<Annotation> = {};
+    if (assignee) values.assignee = assignee;
     if (jira) values.jira_ticket = jira;
     if (target) values.target_location = target;
     if (comment) values.comment = comment;
-    if (userName) values.user_name = userName;
     if (Object.keys(values).length === 0) {
       toast("Enter at least one value to stamp", true);
       return;
@@ -464,6 +464,7 @@ function BulkStamp({
         values,
       });
       onDone(r.updated);
+      setAssignee("");
       setJira("");
       setTarget("");
       setComment("");
@@ -486,7 +487,11 @@ function BulkStamp({
         <div>
           <div className="muted" style={{ marginBottom: 8, fontSize: 11 }}>
             Writes concrete values onto every matching file under this folder
-            (e.g. assign one JIRA ticket to hundreds of files at once).
+            (e.g. assign one JIRA ticket or person to hundreds of files at once).
+          </div>
+          <div className="form-row">
+            <label>Assignee</label>
+            <input value={assignee} onChange={(e) => setAssignee(e.target.value)} />
           </div>
           <div className="form-row">
             <label>JIRA ticket</label>

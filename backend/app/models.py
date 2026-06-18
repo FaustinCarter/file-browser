@@ -117,15 +117,18 @@ class Annotation(Base):
     target_location: Mapped[str | None] = mapped_column(Text, nullable=True)
     jira_ticket: Mapped[str | None] = mapped_column(Text, nullable=True)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    user_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Person assigned to process this object (editable, inheritable).
+    assignee: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
-    )
+    # Audit (set automatically on every change; not inherited). NULL until the
+    # record is first touched.
+    updated_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     node: Mapped[Node] = relationship(back_populates="annotation")
 
     __table_args__ = (
         Index("ix_annotations_dataset", "dataset_id"),
         Index("ix_annotations_jira", "dataset_id", "jira_ticket"),
+        Index("ix_annotations_assignee", "dataset_id", "assignee"),
     )

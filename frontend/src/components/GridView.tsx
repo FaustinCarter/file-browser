@@ -1,15 +1,22 @@
 import { useEffect, useState } from "react";
-import { api, Annotation, FlagField, fmtBytes, folderFlagState, NodeOut } from "../api";
+import {
+  api,
+  Annotation,
+  FlagField,
+  fmtBytes,
+  folderFlagState,
+  NodeOut,
+  UNASSIGNED,
+} from "../api";
 
 interface Props {
   datasetId: number;
-  userName: string;
   toast: (m: string, e?: boolean) => void;
 }
 
 const PAGE_SIZE = 100;
 
-export default function GridView({ datasetId, userName, toast }: Props) {
+export default function GridView({ datasetId, toast }: Props) {
   const [items, setItems] = useState<NodeOut[]>([]);
   const [total, setTotal] = useState(0);
   const [page, setPage] = useState(1);
@@ -24,6 +31,14 @@ export default function GridView({ datasetId, userName, toast }: Props) {
   const [noTransfer, setNoTransfer] = useState<string>("");
   const [processed, setProcessed] = useState<string>("");
   const [jira, setJira] = useState("");
+  const [assignee, setAssignee] = useState("");
+  const [jiraVals, setJiraVals] = useState<string[]>([]);
+  const [assigneeVals, setAssigneeVals] = useState<string[]>([]);
+
+  useEffect(() => {
+    api.distinctValues(datasetId, "jira_ticket").then((r) => setJiraVals(r.values)).catch(() => {});
+    api.distinctValues(datasetId, "assignee").then((r) => setAssigneeVals(r.values)).catch(() => {});
+  }, [datasetId, total]);
 
   const load = () => {
     setLoading(true);
@@ -35,6 +50,7 @@ export default function GridView({ datasetId, userName, toast }: Props) {
         no_transfer: noTransfer || undefined,
         processed: processed || undefined,
         jira: jira || undefined,
+        assignee: assignee || undefined,
         sort,
         direction: dir,
         page,
@@ -78,7 +94,6 @@ export default function GridView({ datasetId, userName, toast }: Props) {
   };
 
   async function patch(id: number, values: Partial<Annotation>) {
-    if (!("user_name" in values) && userName) values.user_name = userName;
     try {
       const updated = await api.updateAnnotation(id, values);
       setItems((prev) => prev.map((it) => (it.id === id ? updated : it)));
@@ -93,10 +108,7 @@ export default function GridView({ datasetId, userName, toast }: Props) {
     try {
       const updated = n.is_dir
         ? await api.folderFlag(n.id, { field, value })
-        : await api.updateAnnotation(n.id, {
-            [field]: value,
-            ...(userName ? { user_name: userName } : {}),
-          } as Partial<Annotation>);
+        : await api.updateAnnotation(n.id, { [field]: value } as Partial<Annotation>);
       setItems((prev) => prev.map((it) => (it.id === n.id ? updated : it)));
     } catch (e: any) {
       toast(String(e.message || e), true);
@@ -105,7 +117,6 @@ export default function GridView({ datasetId, userName, toast }: Props) {
 
   async function bulkApply(values: Partial<Annotation>) {
     if (selected.size === 0) return;
-    if (userName) values.user_name = userName;
     try {
       await Promise.all(Array.from(selected).map((id) => api.updateAnnotation(id, values)));
       toast(`Updated ${selected.size} rows`);
@@ -152,13 +163,24 @@ export default function GridView({ datasetId, userName, toast }: Props) {
           </select>
         </div>
         <div className="filter-group">
+          <label>Assignee</label>
+          <select value={assignee} onChange={(e) => setAssignee(e.target.value)}>
+            <option value="">Any</option>
+            <option value={UNASSIGNED}>Unassigned</option>
+            {assigneeVals.map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+        </div>
+        <div className="filter-group">
           <label>JIRA ticket</label>
-          <input
-            value={jira}
-            onChange={(e) => setJira(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && applyFilters()}
-            placeholder="MIG-123"
-          />
+          <select value={jira} onChange={(e) => setJira(e.target.value)}>
+            <option value="">Any</option>
+            <option value={UNASSIGNED}>No ticket</option>
+            {jiraVals.map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
         </div>
         <div className="filter-group">
           <label>&nbsp;</label>
@@ -192,10 +214,11 @@ export default function GridView({ datasetId, userName, toast }: Props) {
               <th onClick={() => setSortCol("owner")}>Owner</th>
               <th>No Xfer</th>
               <th>Proc.</th>
+              <th>Assignee</th>
               <th>JIRA</th>
               <th>Target location</th>
               <th>Comment</th>
-              <th>User</th>
+              <th>Updated</th>
             </tr>
           </thead>
           <tbody>
@@ -316,6 +339,11 @@ function GridRow({
       <FlagCell n={n} field="no_transfer" onFlag={onFlag} />
       <FlagCell n={n} field="processed" onFlag={onFlag} />
       <CellInput
+        value={eff.assignee || ""}
+        inherited={inh.has("assignee")}
+        onSave={(v) => onPatch(n.id, { assignee: v || null })}
+      />
+      <CellInput
         value={eff.jira_ticket || ""}
         inherited={inh.has("jira_ticket")}
         onSave={(v) => onPatch(n.id, { jira_ticket: v || null })}
@@ -330,11 +358,13 @@ function GridRow({
         inherited={inh.has("comment")}
         onSave={(v) => onPatch(n.id, { comment: v || null })}
       />
-      <CellInput
-        value={eff.user_name || ""}
-        inherited={inh.has("user_name")}
-        onSave={(v) => onPatch(n.id, { user_name: v || null })}
-      />
+      <td
+        className="muted"
+        title={n.updated_at ? new Date(n.updated_at).toLocaleString() : ""}
+        style={{ fontSize: 11, whiteSpace: "nowrap" }}
+      >
+        {n.updated_by || (n.updated_at ? "—" : "")}
+      </td>
     </tr>
   );
 }
@@ -377,6 +407,7 @@ function BulkBar({
   onClear: () => void;
 }) {
   const [jira, setJira] = useState("");
+  const [assignee, setAssignee] = useState("");
   const [target, setTarget] = useState("");
   return (
     <div className="bulkbar">
@@ -385,6 +416,15 @@ function BulkBar({
       <button onClick={() => onApply({ no_transfer: null })}>No Xfer ✗</button>
       <button onClick={() => onApply({ processed: true })}>Processed ✓</button>
       <button onClick={() => onApply({ processed: null })}>Processed ✗</button>
+      <input
+        placeholder="Assignee"
+        value={assignee}
+        onChange={(e) => setAssignee(e.target.value)}
+        style={{ width: 110 }}
+      />
+      <button disabled={!assignee} onClick={() => onApply({ assignee })}>
+        Set assignee
+      </button>
       <input
         placeholder="JIRA ticket"
         value={jira}
