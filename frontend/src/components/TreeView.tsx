@@ -1,5 +1,5 @@
 import { useCallbackRef } from "../hooks";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, FlagState, Filters, fmtBytes, folderFlagState, NodeOut } from "../api";
 
 function flagState(node: NodeOut, field: "no_transfer" | "processed"): FlagState {
@@ -11,12 +11,18 @@ function flagState(node: NodeOut, field: "no_transfer" | "processed"): FlagState
   return node.effective?.[field] ? "all" : "none";
 }
 
+type ExpandedSetter = (updater: (prev: Set<number>) => Set<number>) => void;
+
 interface Props {
   datasetId: number;
   filters: Filters;
   selectedId: number | null;
   onSelect: (n: NodeOut) => void;
   refreshKey: number;
+  // Expansion state lives in the parent so it survives filter changes / tab
+  // switches (the tree refetches data but keeps which folders are open).
+  expanded: Set<number>;
+  setExpanded: ExpandedSetter;
 }
 
 export default function TreeView({
@@ -25,22 +31,62 @@ export default function TreeView({
   selectedId,
   onSelect,
   refreshKey,
+  expanded,
+  setExpanded,
 }: Props) {
   const [roots, setRoots] = useState<NodeOut[] | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const seededRef = useRef<number | null>(null);
 
+  // Show the loading placeholder only when the dataset itself changes; filter
+  // changes refetch in place so expansion state and scroll position are kept.
   useEffect(() => {
     setRoots(null);
+    seededRef.current = null;
+  }, [datasetId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRefreshing(true);
     api
       .children(datasetId, null, filters)
-      .then((r) => setRoots(r.children))
-      .catch(() => setRoots([]));
-  }, [datasetId, filters, refreshKey]);
+      .then((r) => {
+        if (cancelled) return;
+        setRoots(r.children);
+        // Expand the top-level folders the first time we load a dataset.
+        if (seededRef.current !== datasetId) {
+          seededRef.current = datasetId;
+          const rootIds = r.children.filter((c) => c.is_dir).map((c) => c.id);
+          if (rootIds.length) {
+            setExpanded((prev) => {
+              const next = new Set(prev);
+              rootIds.forEach((id) => next.add(id));
+              return next;
+            });
+          }
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setRoots([]);
+      })
+      .finally(() => {
+        if (!cancelled) setRefreshing(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [datasetId, filters, refreshKey, setExpanded]);
 
   if (roots === null) return <div className="empty">Loading…</div>;
   if (roots.length === 0) return <div className="empty">No data in this dataset.</div>;
 
   return (
     <div className="tree">
+      {refreshing && (
+        <div className="muted" style={{ padding: "1px 8px", fontSize: 11 }}>
+          updating…
+        </div>
+      )}
       {roots.map((n) => (
         <TreeNode
           key={n.id}
@@ -51,7 +97,8 @@ export default function TreeView({
           selectedId={selectedId}
           onSelect={onSelect}
           refreshKey={refreshKey}
-          defaultExpanded
+          expanded={expanded}
+          setExpanded={setExpanded}
         />
       ))}
     </div>
@@ -66,7 +113,8 @@ function TreeNode({
   selectedId,
   onSelect,
   refreshKey,
-  defaultExpanded = false,
+  expanded,
+  setExpanded,
 }: {
   node: NodeOut;
   datasetId: number;
@@ -75,9 +123,10 @@ function TreeNode({
   selectedId: number | null;
   onSelect: (n: NodeOut) => void;
   refreshKey: number;
-  defaultExpanded?: boolean;
+  expanded: Set<number>;
+  setExpanded: ExpandedSetter;
 }) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const isExpanded = node.is_dir && expanded.has(node.id);
   const [children, setChildren] = useState<NodeOut[] | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -90,10 +139,20 @@ function TreeNode({
       .finally(() => setLoading(false));
   });
 
-  // Reload children when expanded or when filters/refresh change (if open).
+  // (Re)load children whenever this node is open and the filters/refresh change.
   useEffect(() => {
-    if (expanded && node.is_dir) load();
-  }, [expanded, filters, refreshKey]);
+    if (isExpanded) load();
+  }, [isExpanded, filters, refreshKey]);
+
+  const toggle = () => {
+    if (!node.is_dir) return;
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(node.id)) next.delete(node.id);
+      else next.add(node.id);
+      return next;
+    });
+  };
 
   const isSel = selectedId === node.id;
   const eff = node.effective;
@@ -109,10 +168,10 @@ function TreeNode({
           className="twisty"
           onClick={(e) => {
             e.stopPropagation();
-            if (node.is_dir) setExpanded((x) => !x);
+            toggle();
           }}
         >
-          {node.is_dir ? (expanded ? "▾" : "▸") : ""}
+          {node.is_dir ? (isExpanded ? "▾" : "▸") : ""}
         </span>
         <span className="icon">{node.is_dir ? "📁" : "📄"}</span>
         <span className="nm">{node.name}</span>
@@ -153,9 +212,9 @@ function TreeNode({
           <span className="muted">{node.last_accessed || ""}</span>
         </span>
       </div>
-      {expanded && (
+      {isExpanded && (
         <div>
-          {loading && (
+          {loading && children === null && (
             <div className="muted" style={{ paddingLeft: 8 + (depth + 1) * 16 }}>
               loading…
             </div>
@@ -170,6 +229,8 @@ function TreeNode({
               selectedId={selectedId}
               onSelect={onSelect}
               refreshKey={refreshKey}
+              expanded={expanded}
+              setExpanded={setExpanded}
             />
           ))}
           {children && children.length === 0 && !loading && (

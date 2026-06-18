@@ -11,6 +11,7 @@ export default function App() {
   const [tab, setTab] = useState<"tree" | "grid">("tree");
   const [filters, setFilters] = useState<Filters>({});
   const [selected, setSelected] = useState<NodeOut | null>(null);
+  const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [refreshKey, setRefreshKey] = useState(0);
   const [userName, setUserName] = useState(localStorage.getItem("fb_user") || "");
   const [toastMsg, setToast] = useState<{ msg: string; err?: boolean } | null>(null);
@@ -31,10 +32,11 @@ export default function App() {
     refreshDatasets();
   }, []);
 
-  // Reset selection/filters when switching datasets.
+  // Reset selection/filters/expansion when switching datasets.
   useEffect(() => {
     setSelected(null);
     setFilters({});
+    setExpanded(new Set());
   }, [current]);
 
   async function onUpload(file: File) {
@@ -144,6 +146,8 @@ export default function App() {
               selectedId={selected?.id ?? null}
               onSelect={setSelected}
               refreshKey={refreshKey}
+              expanded={expanded}
+              setExpanded={setExpanded}
             />
           </div>
           <div className="right">
