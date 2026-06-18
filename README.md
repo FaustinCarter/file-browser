@@ -110,7 +110,10 @@ into sortable numeric values while the original strings are kept for display.
 - *All file types in a folder with counts, sortable & filterable* — the detail
   panel's "File types here" table / `GET /api/nodes/{id}/type-breakdown`.
 - *Mark files/folders Keep/Processed (recursive)* — checkboxes in the detail or
-  grid view; folders cascade via inheritance.
+  grid view; folders cascade via inheritance. **With a tree filter active**
+  (file type and/or last-accessed), editing a folder applies only to the
+  *matching* files in its subtree — other types and the folder itself are left
+  untouched.
 - *Target location, JIRA ticket, comment, user* — editable columns; bulk-edit by
   selection (grid) or by filtered subtree (detail panel's "Bulk stamp").
 

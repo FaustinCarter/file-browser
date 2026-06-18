@@ -109,6 +109,15 @@ export const api = {
       j<{ file_count: number; folder_count: number }>(r),
     ),
 
+  stats: (id: number, filters: Filters) =>
+    fetch(
+      `/api/nodes/${id}/stats${qs({
+        types: filters.types,
+        accessed_after: filters.accessed_after,
+        accessed_before: filters.accessed_before,
+      })}`,
+    ).then((r) => j<{ file_count: number; total_size: number }>(r)),
+
   typeBreakdown: (id: number, filters: Filters, search?: string) =>
     fetch(
       `/api/nodes/${id}/type-breakdown${qs({

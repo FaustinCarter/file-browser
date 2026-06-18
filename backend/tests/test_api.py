@@ -126,6 +126,56 @@ def test_bulk_annotation_stamps_descendants(client, loaded):
     assert g["total"] == 2
 
 
+def test_filtered_folder_flag_only_matching_type(client, loaded):
+    """Checking Keep on a folder with a type filter active must touch only the
+    matching files; other types in the subtree stay unchanged."""
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")  # 2 pptx + 1 xlsx
+    r = client.post(
+        "/api/nodes/bulk-annotation",
+        json={
+            "node_id": reports["id"],
+            "files_only": True,
+            "include_self": False,
+            "types": ["PPTX File"],
+            "values": {"keep": True},
+        },
+    )
+    assert r.json()["updated"] == 2
+
+    deck = client.get(f"/api/nodes/{_find(client, ds['id'], 'deck.pptx')['id']}").json()
+    assert deck["effective"]["keep"] is True  # a PPTX got it
+
+    data = client.get(f"/api/nodes/{_find(client, ds['id'], 'data.xlsx')['id']}").json()
+    assert data["effective"]["keep"] is None  # the XLSX did not
+
+    # the folder itself is untouched
+    rep = client.get(f"/api/nodes/{reports['id']}").json()
+    assert rep["own"]["keep"] is None
+
+
+def test_filtered_folder_flag_respects_last_accessed(client, loaded):
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    # deck.pptx & data.xlsx accessed 2024; notes.pptx accessed 01/15/2020.
+    r = client.post(
+        "/api/nodes/bulk-annotation",
+        json={
+            "node_id": reports["id"],
+            "files_only": True,
+            "include_self": False,
+            "accessed_after": "2023-01-01",
+            "values": {"keep": True},
+        },
+    )
+    assert r.json()["updated"] == 2  # deck + data, not notes
+
+    notes = client.get(f"/api/nodes/{_find(client, ds['id'], 'notes.pptx')['id']}").json()
+    assert notes["effective"]["keep"] is None  # old file excluded
+    deck = client.get(f"/api/nodes/{_find(client, ds['id'], 'deck.pptx')['id']}").json()
+    assert deck["effective"]["keep"] is True
+
+
 def test_search_filters_and_pagination(client, loaded):
     ds = loaded
     r = client.get(

@@ -25,6 +25,13 @@ export default function DetailPanel({
 }: Props) {
   const [node, setNode] = useState<NodeOut | null>(null);
   const [counts, setCounts] = useState<{ file_count: number; folder_count: number } | null>(null);
+  const [matchCount, setMatchCount] = useState<number | null>(null);
+
+  const filterActive = !!(
+    (filters.types && filters.types.length) ||
+    filters.accessed_after ||
+    filters.accessed_before
+  );
 
   const reload = () => {
     api.node(nodeId).then(setNode);
@@ -40,6 +47,16 @@ export default function DetailPanel({
     if (node?.is_dir) api.counts(nodeId).then(setCounts);
   }, [node?.is_dir, nodeId]);
 
+  // When a folder is selected with an active filter, count how many files the
+  // scoped edits would touch.
+  useEffect(() => {
+    if (node?.is_dir && filterActive) {
+      api.stats(nodeId, filters).then((s) => setMatchCount(s.file_count));
+    } else {
+      setMatchCount(null);
+    }
+  }, [node?.is_dir, nodeId, filterActive, filters]);
+
   if (!node) return <div className="detail muted">Loading…</div>;
 
   const eff = node.effective!;
@@ -54,6 +71,28 @@ export default function DetailPanel({
       setNode(updated);
       onMutated();
       toast("Saved");
+    } catch (e: any) {
+      toast(String(e.message || e), true);
+    }
+  }
+
+  // Folder edit while a filter is active: stamp only the matching files in the
+  // subtree (recursively), leaving other types and the folder itself untouched.
+  async function applyScoped(values: Partial<Annotation>) {
+    if (userName) values.user_name = userName;
+    try {
+      const r = await api.bulkAnnotation({
+        node_id: nodeId,
+        files_only: true,
+        include_self: false,
+        types: filters.types,
+        accessed_after: filters.accessed_after,
+        accessed_before: filters.accessed_before,
+        values,
+      });
+      toast(`Updated ${r.updated.toLocaleString()} matching file(s)`);
+      onMutated();
+      reload();
     } catch (e: any) {
       toast(String(e.message || e), true);
     }
@@ -106,53 +145,67 @@ export default function DetailPanel({
       </div>
 
       <div className="section">
-        <h3>Editable {node.is_dir && "(applies to contents via inheritance)"}</h3>
-        <div className="checks">
-          <label>
-            <input
-              type="checkbox"
-              ref={(el) => {
-                if (el) el.indeterminate = own.keep === null && inh.has("keep");
-              }}
-              checked={!!eff.keep}
-              onChange={(e) => save({ keep: e.target.checked })}
-            />
-            Keep?{" "}
-            {inh.has("keep") && <span className="inherited">(inherited)</span>}
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={!!eff.processed}
-              onChange={(e) => save({ processed: e.target.checked })}
-            />
-            Processed?{" "}
-            {inh.has("processed") && <span className="inherited">(inherited)</span>}
-          </label>
-        </div>
-        {(eff.keep !== null || eff.processed !== null) && (
-          <div style={{ marginBottom: 8 }}>
-            <button
-              onClick={() => save({ keep: null, processed: null })}
-              title="Clear flags on this node (revert to inheriting from parent)"
-            >
-              Clear flags → inherit
-            </button>
-          </div>
-        )}
+        <h3>
+          Editable
+          {node.is_dir &&
+            (filterActive
+              ? " — filter active: matching files only"
+              : " (applies to contents via inheritance)")}
+        </h3>
+        {node.is_dir && filterActive ? (
+          <ScopedFolderEdit matchCount={matchCount} onApply={applyScoped} />
+        ) : (
+          <>
+            <div className="checks">
+              <label>
+                <input
+                  type="checkbox"
+                  ref={(el) => {
+                    if (el) el.indeterminate = own.keep === null && inh.has("keep");
+                  }}
+                  checked={!!eff.keep}
+                  onChange={(e) => save({ keep: e.target.checked })}
+                />
+                Keep?{" "}
+                {inh.has("keep") && <span className="inherited">(inherited)</span>}
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={!!eff.processed}
+                  onChange={(e) => save({ processed: e.target.checked })}
+                />
+                Processed?{" "}
+                {inh.has("processed") && (
+                  <span className="inherited">(inherited)</span>
+                )}
+              </label>
+            </div>
+            {(eff.keep !== null || eff.processed !== null) && (
+              <div style={{ marginBottom: 8 }}>
+                <button
+                  onClick={() => save({ keep: null, processed: null })}
+                  title="Clear flags on this node (revert to inheriting from parent)"
+                >
+                  Clear flags → inherit
+                </button>
+              </div>
+            )}
 
-        {EDIT_FIELDS.map((f) => (
-          <EditableField
-            key={f.key}
-            label={f.label}
-            value={(eff[f.key] as string) || ""}
-            inherited={inh.has(f.key)}
-            onSave={(v) => save({ [f.key]: v || null } as Partial<Annotation>)}
-          />
-        ))}
+            {EDIT_FIELDS.map((f) => (
+              <EditableField
+                key={f.key}
+                label={f.label}
+                value={(eff[f.key] as string) || ""}
+                inherited={inh.has(f.key)}
+                onSave={(v) => save({ [f.key]: v || null } as Partial<Annotation>)}
+              />
+            ))}
+          </>
+        )}
       </div>
 
-      {node.is_dir && (
+      {node.is_dir && !filterActive && (
         <BulkStamp
           node={node}
           filters={filters}
@@ -206,6 +259,92 @@ function EditableField({
             Save
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+function ScopedFolderEdit({
+  matchCount,
+  onApply,
+}: {
+  matchCount: number | null;
+  onApply: (v: Partial<Annotation>) => void;
+}) {
+  const n = matchCount ?? 0;
+  return (
+    <div>
+      <div className="muted" style={{ marginBottom: 10, fontSize: 11 }}>
+        A filter is active, so changes here apply <b>recursively to the{" "}
+        {n.toLocaleString()} matching file(s)</b> in this subtree only. Other file
+        types (and the folder itself) are left unchanged.
+      </div>
+      <FlagButtons
+        label="Keep?"
+        n={n}
+        onSet={(v) => onApply({ keep: v })}
+      />
+      <FlagButtons
+        label="Processed?"
+        n={n}
+        onSet={(v) => onApply({ processed: v })}
+      />
+      <ScopedText label="Target location" n={n} onApply={(v) => onApply({ target_location: v || null })} />
+      <ScopedText label="JIRA ticket" n={n} onApply={(v) => onApply({ jira_ticket: v || null })} />
+      <ScopedText label="Comment" n={n} onApply={(v) => onApply({ comment: v || null })} />
+    </div>
+  );
+}
+
+function FlagButtons({
+  label,
+  n,
+  onSet,
+}: {
+  label: string;
+  n: number;
+  onSet: (v: boolean | null) => void;
+}) {
+  return (
+    <div className="form-row">
+      <label>{label}</label>
+      <div style={{ display: "flex", gap: 6 }}>
+        <button className="primary" disabled={!n} onClick={() => onSet(true)}>
+          Set ✓ on {n.toLocaleString()}
+        </button>
+        <button disabled={!n} onClick={() => onSet(false)}>
+          Set ✗
+        </button>
+        <button
+          disabled={!n}
+          onClick={() => onSet(null)}
+          title="Clear the flag on matching files (revert to inheriting)"
+        >
+          Clear
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ScopedText({
+  label,
+  n,
+  onApply,
+}: {
+  label: string;
+  n: number;
+  onApply: (v: string) => void;
+}) {
+  const [v, setV] = useState("");
+  return (
+    <div className="form-row">
+      <label>{label}</label>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input style={{ flex: 1 }} value={v} onChange={(e) => setV(e.target.value)} />
+        <button className="primary" disabled={!n} onClick={() => onApply(v)}>
+          Apply to {n.toLocaleString()}
+        </button>
       </div>
     </div>
   );
