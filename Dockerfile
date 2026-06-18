@@ -1,5 +1,7 @@
 # ---- Stage 1: build the React frontend ----
-FROM node:22-slim AS frontend
+# Build on the native builder arch ($BUILDPLATFORM) since the output is just
+# static files; avoids emulating Node when cross-building for linux/amd64.
+FROM --platform=$BUILDPLATFORM node:22-slim AS frontend
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install

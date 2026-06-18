@@ -61,6 +61,42 @@ A ready-made test dataset lives at `sample_data/fake_fileserver.csv`
 
 ---
 
+## Offline / air-gapped deployment (build on Mac, run on RHEL)
+
+The images target **`linux/amd64`** (set in `docker-compose.yml`), so they run on
+a standard x86-64 RHEL host even when built on an Apple-silicon Mac. The app is
+fully self-contained at runtime — the frontend is bundled into the image (system
+fonts, same-origin API; **no CDN/web fonts**) and the backend makes no outbound
+calls — so the only things the offline host needs are the two Docker images.
+
+**On the build machine (online, e.g. a Mac with Docker Desktop):**
+
+```bash
+./scripts/build-offline.sh      # -> file-browser-offline.tar
+```
+
+This pulls `postgres:16` for amd64, builds `file-browser-web:latest` for amd64
+(Node/Python/pip/apt resources are all baked into the image), and `docker save`s
+both into one tarball. Copy `file-browser-offline.tar` and `docker-compose.yml`
+(plus an optional `.env`) to the RHEL host.
+
+**On the RHEL host (offline):**
+
+```bash
+docker load -i file-browser-offline.tar
+docker compose up -d
+```
+
+`pull_policy: never` on both services guarantees Compose uses the loaded images
+and never contacts a registry. The first run creates the schema automatically;
+data lives in the `pgdata` volume.
+
+> Building amd64 on Apple silicon uses Docker Desktop's buildx + QEMU emulation
+> (the frontend stage builds natively via `$BUILDPLATFORM` for speed). If you
+> build on an x86-64 machine, no emulation is involved.
+
+---
+
 ## Local development (without Docker)
 
 **Backend** (needs a reachable PostgreSQL):

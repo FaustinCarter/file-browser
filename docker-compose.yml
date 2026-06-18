@@ -1,6 +1,10 @@
 services:
   db:
     image: postgres:16
+    # Build/run for x86-64 even when building on an Apple-silicon Mac.
+    platform: linux/amd64
+    # Offline host: never reach a registry; use the locally loaded image.
+    pull_policy: never
     environment:
       POSTGRES_USER: filebrowser
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-filebrowser}
@@ -15,7 +19,13 @@ services:
     restart: unless-stopped
 
   web:
-    build: .
+    image: file-browser-web:latest
+    platform: linux/amd64
+    pull_policy: never
+    build:
+      context: .
+      platforms:
+        - linux/amd64
     depends_on:
       db:
         condition: service_healthy
