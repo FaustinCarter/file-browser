@@ -96,6 +96,28 @@ data lives in the `pgdata` volume.
 > (the frontend stage builds natively via `$BUILDPLATFORM` for speed). If you
 > build on an x86-64 machine, no emulation is involved.
 
+### Database provisioning / troubleshooting
+
+The web container creates its database on startup if it's missing, so a normal
+`docker compose up` provisions everything. Two things to know:
+
+- **"database \"filebrowser\" does not exist" / "skipping initialization".** The
+  `postgres` image only creates the database and configures auth on the *first*
+  init of an **empty** data directory. If an earlier boot was interrupted
+  mid-init (common on a slow first air-gapped start), the `pgdata` volume is left
+  half-provisioned and never re-initialises. The app now self-heals the missing
+  database, but if you also see **`FATAL: no pg_hba.conf entry`** the cluster's
+  auth itself is broken and the volume must be reset:
+
+  ```bash
+  docker compose down -v        # ⚠ deletes the pgdata volume (and its data)
+  docker compose up -d
+  ```
+
+- **External / managed Postgres.** Point `DATABASE_URL` at it; the role in the
+  URL needs `CREATEDB` (or pre-create the database yourself). The app creates the
+  database if absent and then manages its own schema.
+
 ---
 
 ## Local development (without Docker)
