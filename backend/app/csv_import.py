@@ -1,15 +1,20 @@
 """Import a Windows file-server CSV export into the database.
 
 The importer is tolerant about header naming (the Windows tools vary slightly)
-and builds the materialized-path tree in a single pass by assigning ids in
-ancestor-first order.
+and builds the materialized-path tree with **bounded memory** so multi-GB
+exports (millions of rows) don't blow up the worker:
+
+* the upload is streamed to a temp file (the caller does this) and parsed from
+  disk, never decoded whole into RAM;
+* it runs in two passes — folders first, then files — so only the (relatively
+  small) set of folders is held in memory for parent resolution; files are
+  streamed and inserted in fixed-size batches and never all held at once.
 """
 from __future__ import annotations
 
 import csv
 import io
 import re
-from dataclasses import dataclass, field
 
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
@@ -17,13 +22,16 @@ from sqlalchemy.orm import Session
 from . import parsing
 from .models import Dataset, Node
 
+# Rows per INSERT batch — keeps peak memory flat regardless of file size.
+_BATCH = 5000
+# CSV fields can be long; lift the default 128 KB field-size cap.
+csv.field_size_limit(64 * 1024 * 1024)
+
 
 def _norm(h: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (h or "").lower())
 
 
-# target -> matcher. First matcher that returns True wins; we try exact-ish
-# matches before fuzzy "contains" ones by checking equality first.
 _EXACT = {
     "name": "name",
     "full_path": "fullpath",
@@ -48,11 +56,8 @@ def resolve_headers(fieldnames: list[str]) -> dict[str, str | None]:
     for target, key in _EXACT.items():
         resolved[target] = norm_to_orig.get(key)
 
-    # Fuzzy ones.
-    def find_contains(*needles: str, avoid: str | None = None) -> str | None:
+    def find_contains(*needles: str) -> str | None:
         for nh, orig in norm_to_orig.items():
-            if avoid and avoid in nh:
-                continue
             if all(n in nh for n in needles):
                 return orig
         return None
@@ -62,142 +67,190 @@ def resolve_headers(fieldnames: list[str]) -> dict[str, str | None]:
     return resolved
 
 
-@dataclass
-class _Rec:
-    data: dict
-    path_key: str
-    parent_key: str | None
-    # filled in during id assignment
-    id: int = 0
-    parent_id: int | None = None
-    mat_path: str = ""
-    depth: int = 0
+def _resolve_indices(header: list[str]) -> dict[str, int | None]:
+    name_map = resolve_headers(header)
+    return {
+        target: (header.index(orig) if orig in header else None)
+        for target, orig in name_map.items()
+    }
 
+
+def _cell(row: list[str], i: int | None):
+    if i is None or i < 0 or i >= len(row):
+        return None
+    return row[i]
+
+
+def _parse_row(row: list[str], idx: dict[str, int | None]) -> dict:
+    full_path = (_cell(row, idx["full_path"]) or "").strip()
+    is_dir = parsing.is_directory(full_path)
+    name_val = (_cell(row, idx["name"]) or "").strip()
+    if not name_val:
+        name_val = parsing.normalize_path(full_path).rsplit("/", 1)[-1]
+    return {
+        "name": name_val,
+        "full_path": full_path,
+        "path_key": parsing.normalize_path(full_path),
+        "is_dir": is_dir,
+        "size_raw": _s(_cell(row, idx["size"])),
+        "size_bytes": parsing.parse_size(_cell(row, idx["size"])),
+        "allocated_raw": _s(_cell(row, idx["allocated"])),
+        "allocated_bytes": parsing.parse_size(_cell(row, idx["allocated"])),
+        "files_count": parsing.parse_int(_cell(row, idx["files"])),
+        "folders_count": parsing.parse_int(_cell(row, idx["folders"])),
+        "pct_parent_raw": _s(_cell(row, idx["pct_parent"])),
+        "pct_parent": parsing.parse_percent(_cell(row, idx["pct_parent"])),
+        "last_modified": parsing.parse_date(_cell(row, idx["last_modified"])),
+        "last_accessed": parsing.parse_date(_cell(row, idx["last_accessed"])),
+        "owner": _s(_cell(row, idx["owner"])),
+        "file_type": _normalize_type(_cell(row, idx["file_type"]), is_dir),
+        "dir_level": parsing.parse_int(_cell(row, idx["dir_level"])),
+    }
+
+
+# ---- Public entry points ----
 
 def import_csv(db: Session, *, name: str, filename: str, content: bytes | str) -> Dataset:
+    """Import from an in-memory string/bytes (used by tests and small inputs)."""
     if isinstance(content, bytes):
+        content = content.decode("utf-8-sig", errors="replace")
+
+    def opener():
+        return io.StringIO(content)
+
+    return _run(db, name=name, filename=filename, opener=opener)
+
+
+def import_csv_path(db: Session, *, name: str, filename: str, path: str) -> Dataset:
+    """Import by streaming from a file on disk (used for large uploads)."""
+
+    def opener():
         # utf-8-sig strips a BOM if the Windows tool added one.
-        text_content = content.decode("utf-8-sig", errors="replace")
-    else:
-        text_content = content
+        return open(path, encoding="utf-8-sig", errors="replace", newline="")
 
-    reader = csv.DictReader(io.StringIO(text_content))
-    if not reader.fieldnames:
-        raise ValueError("CSV has no header row")
-    cols = resolve_headers(list(reader.fieldnames))
-    if not cols.get("full_path"):
+    return _run(db, name=name, filename=filename, opener=opener)
+
+
+def _run(db: Session, *, name: str, filename: str, opener) -> Dataset:
+    # ---- header ----
+    with opener() as fh:
+        reader = csv.reader(fh)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError("CSV has no header row")
+    idx = _resolve_indices(header)
+    if idx.get("full_path") is None:
         raise ValueError(
-            "Could not find a 'Full Path' column in the CSV. "
-            f"Headers seen: {reader.fieldnames}"
+            f"Could not find a 'Full Path' column in the CSV. Headers seen: {header}"
         )
 
-    def g(row: dict, target: str):
-        src = cols.get(target)
-        return row.get(src) if src else None
-
-    records: list[_Rec] = []
-    by_key: dict[str, _Rec] = {}
-
-    for row in reader:
-        full_path = (g(row, "full_path") or "").strip()
-        if not full_path:
-            continue
-        is_dir = parsing.is_directory(full_path)
-        name_val = (g(row, "name") or "").strip()
-        if not name_val:
-            # derive from path
-            name_val = parsing.normalize_path(full_path).rsplit("/", 1)[-1]
-        pkey = parsing.normalize_path(full_path)
-        rec = _Rec(
-            data={
-                "name": name_val,
-                "full_path": full_path,
-                "path_key": pkey,
-                "is_dir": is_dir,
-                "size_raw": _s(g(row, "size")),
-                "size_bytes": parsing.parse_size(g(row, "size")),
-                "allocated_raw": _s(g(row, "allocated")),
-                "allocated_bytes": parsing.parse_size(g(row, "allocated")),
-                "files_count": parsing.parse_int(g(row, "files")),
-                "folders_count": parsing.parse_int(g(row, "folders")),
-                "pct_parent_raw": _s(g(row, "pct_parent")),
-                "pct_parent": parsing.parse_percent(g(row, "pct_parent")),
-                "last_modified": parsing.parse_date(g(row, "last_modified")),
-                "last_accessed": parsing.parse_date(g(row, "last_accessed")),
-                "owner": _s(g(row, "owner")),
-                "file_type": _normalize_type(g(row, "file_type"), is_dir),
-                "dir_level": parsing.parse_int(g(row, "dir_level")),
-            },
-            path_key=pkey,
-            parent_key=parsing.parent_key(full_path),
-        )
-        records.append(rec)
-        by_key.setdefault(pkey, rec)
-
-    if not records:
-        raise ValueError("CSV contained no usable rows")
-
-    # Ancestor-first ordering: shorter paths first guarantees a node's parent is
-    # processed before it.
-    records.sort(key=lambda r: (r.path_key.count("/"), r.path_key))
-
-    # Create the dataset row to get an id.
-    dataset = Dataset(name=name, filename=filename, row_count=len(records))
+    dataset = Dataset(name=name, filename=filename, row_count=0)
     db.add(dataset)
     db.flush()  # assigns dataset.id
 
-    # Reserve a contiguous id block so we can compute mat_path in memory.
     max_id = db.execute(select(func.coalesce(func.max(Node.id), 0))).scalar_one()
     next_id = int(max_id) + 1
 
-    for rec in records:
-        rec.id = next_id
+    # ---- pass 1: folders (held in memory for parent resolution) ----
+    folders: list[dict] = []
+    with opener() as fh:
+        reader = csv.reader(fh)
+        next(reader, None)  # skip header
+        fp_i = idx["full_path"]
+        for row in reader:
+            fp = (_cell(row, fp_i) or "").strip()
+            if fp and parsing.is_directory(fp):
+                folders.append(_parse_row(row, idx))
+
+    # Ancestor-first so a folder's parent is processed before it.
+    folders.sort(key=lambda d: (d["path_key"].count("/"), d["path_key"]))
+
+    # folder path_key -> (id, mat_path, depth)
+    folder_map: dict[str, tuple[int, str, int]] = {}
+    batch: list[dict] = []
+    for data in folders:
+        nid = next_id
         next_id += 1
-
-    # Resolve parents (walk up the path until we find a known ancestor).
-    for rec in records:
-        parent = _find_parent(rec, by_key)
+        parent = _find_parent(parsing.parent_key(data["full_path"]), folder_map)
         if parent is not None:
-            rec.parent_id = parent.id
-            rec.mat_path = f"{parent.mat_path}{rec.id}/"
-            rec.depth = parent.depth + 1
+            pid, pmat, pdepth = parent
+            mat_path, depth, parent_id = f"{pmat}{nid}/", pdepth + 1, pid
         else:
-            rec.parent_id = None
-            rec.mat_path = f"/{rec.id}/"
-            rec.depth = 0
+            mat_path, depth, parent_id = f"/{nid}/", 0, None
+        folder_map[data["path_key"]] = (nid, mat_path, depth)
+        batch.append(_row_mapping(data, nid, dataset.id, parent_id, mat_path, depth))
+        if len(batch) >= _BATCH:
+            _flush(db, batch)
+    _flush(db, batch)
+    folder_count = len(folders)
+    del folders  # free before streaming files
 
-    mappings = []
-    for rec in records:
-        d = dict(rec.data)
-        d.update(
-            id=rec.id,
-            dataset_id=dataset.id,
-            parent_id=rec.parent_id,
-            mat_path=rec.mat_path,
-            depth=rec.depth,
-        )
-        mappings.append(d)
+    # ---- pass 2: files (streamed, never all held) ----
+    file_count = 0
+    with opener() as fh:
+        reader = csv.reader(fh)
+        next(reader, None)  # skip header
+        fp_i = idx["full_path"]
+        for row in reader:
+            fp = (_cell(row, fp_i) or "").strip()
+            if not fp or parsing.is_directory(fp):
+                continue
+            data = _parse_row(row, idx)
+            nid = next_id
+            next_id += 1
+            parent = _find_parent(parsing.parent_key(fp), folder_map)
+            if parent is not None:
+                pid, pmat, pdepth = parent
+                mat_path, depth, parent_id = f"{pmat}{nid}/", pdepth + 1, pid
+            else:
+                mat_path, depth, parent_id = f"/{nid}/", 0, None
+            batch.append(_row_mapping(data, nid, dataset.id, parent_id, mat_path, depth))
+            file_count += 1
+            if len(batch) >= _BATCH:
+                _flush(db, batch)
+    _flush(db, batch)
 
-    db.bulk_insert_mappings(Node, mappings)
+    total = folder_count + file_count
+    if total == 0:
+        db.rollback()
+        raise ValueError("CSV contained no usable rows")
 
-    # Keep the sequence ahead of our manually assigned ids (Postgres only).
+    dataset.row_count = total
     if db.bind.dialect.name == "postgresql":
         db.execute(
             text("SELECT setval(pg_get_serial_sequence('nodes','id'), :v)"),
             {"v": next_id},
         )
-
     db.commit()
     return dataset
 
 
-def _find_parent(rec: _Rec, by_key: dict[str, _Rec]) -> _Rec | None:
-    key = rec.parent_key
+def _row_mapping(data, nid, dataset_id, parent_id, mat_path, depth) -> dict:
+    d = dict(data)
+    d.update(
+        id=nid,
+        dataset_id=dataset_id,
+        parent_id=parent_id,
+        mat_path=mat_path,
+        depth=depth,
+    )
+    return d
+
+
+def _flush(db: Session, batch: list[dict]) -> None:
+    if batch:
+        db.bulk_insert_mappings(Node, batch)
+        batch.clear()
+
+
+def _find_parent(parent_key, folder_map):
+    """Nearest ancestor folder for ``parent_key`` (walk the path upward)."""
+    key = parent_key
     while key:
-        parent = by_key.get(key)
-        if parent is not None and parent is not rec:
-            return parent
-        # walk up another level
+        found = folder_map.get(key)
+        if found is not None:
+            return found
         if "/" not in key:
             break
         key = key.rsplit("/", 1)[0]

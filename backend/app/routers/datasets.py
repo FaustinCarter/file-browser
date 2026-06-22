@@ -1,6 +1,10 @@
 """Dataset upload / list / delete endpoints."""
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -19,19 +23,30 @@ def list_datasets(db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=DatasetOut)
-async def upload_dataset(
+def upload_dataset(
     file: UploadFile = File(...),
     name: str | None = Form(None),
     db: Session = Depends(get_db),
 ):
-    content = await file.read()
+    # A plain (sync) endpoint runs in a threadpool, so the multi-minute import of
+    # a large file doesn't block the event loop. Stream the upload to a temp file
+    # instead of reading it all into RAM, then parse from disk.
     ds_name = (name or "").strip() or (file.filename or "dataset").rsplit(".", 1)[0]
+    tmp = tempfile.NamedTemporaryFile(prefix="fb_upload_", suffix=".csv", delete=False)
     try:
-        dataset = csv_import.import_csv(
-            db, name=ds_name, filename=file.filename or "upload.csv", content=content
+        shutil.copyfileobj(file.file, tmp, length=1024 * 1024)
+        tmp.flush()
+        tmp.close()
+        dataset = csv_import.import_csv_path(
+            db, name=ds_name, filename=file.filename or "upload.csv", path=tmp.name
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
     return dataset
 
 

@@ -13,7 +13,11 @@ Every change records who touched it and when.
 ## Highlights
 
 - **Handles scale.** Data lives in PostgreSQL with a materialized-path tree, so
-  descendant counts and subtree queries stay fast at millions of rows.
+  descendant counts and subtree queries stay fast at millions of rows. Uploads are
+  streamed to disk and imported in batches with **bounded memory** (~the file
+  size, not a multiple of it), so multi-GB exports don't exhaust the worker. A
+  large import can take several minutes and is held open for the request, so raise
+  your reverse proxy's body-size limit and read timeout (see below).
 - **Interactive tree explorer** with lazy loading, file-type filtering, and a
   last-accessed date range. Every folder shows its size and a **file counter
   that respects the active filters**.
