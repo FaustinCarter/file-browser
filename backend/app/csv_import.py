@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 import re
 
 from sqlalchemy import func, select, text
@@ -22,8 +23,11 @@ from sqlalchemy.orm import Session
 from . import parsing
 from .models import Dataset, Node
 
-# Rows per INSERT batch — keeps peak memory flat regardless of file size.
-_BATCH = 5000
+# Rows per INSERT/COPY batch — keeps peak memory flat regardless of file size.
+# Tunable via env; COPY makes huge batches unnecessary (diminishing returns).
+_BATCH = max(1, int(os.environ.get("IMPORT_BATCH_SIZE", "50000")))
+# Use Postgres COPY for the bulk load (much faster than INSERT). Off -> ORM bulk.
+_USE_COPY = os.environ.get("IMPORT_USE_COPY", "1") != "0"
 # CSV fields can be long; lift the default 128 KB field-size cap.
 csv.field_size_limit(64 * 1024 * 1024)
 
@@ -239,9 +243,54 @@ def _row_mapping(data, nid, dataset_id, parent_id, mat_path, depth) -> dict:
 
 
 def _flush(db: Session, batch: list[dict]) -> None:
-    if batch:
+    if not batch:
+        return
+    if _USE_COPY and db.bind.dialect.name == "postgresql":
+        _copy_flush(db, batch)
+    else:
         db.bulk_insert_mappings(Node, batch)
-        batch.clear()
+    batch.clear()
+
+
+# Column order used by the COPY fast path.
+_COPY_COLUMNS = [
+    "id", "dataset_id", "parent_id", "mat_path", "depth", "name", "full_path",
+    "path_key", "is_dir", "size_raw", "size_bytes", "allocated_raw",
+    "allocated_bytes", "files_count", "folders_count", "pct_parent_raw",
+    "pct_parent", "last_modified", "last_accessed", "owner", "file_type",
+    "dir_level",
+]
+
+
+def _copy_value(d: dict, key: str):
+    v = d.get(key)
+    if v is None:
+        return None
+    if key == "is_dir":
+        return "t" if v else "f"
+    if key in ("last_modified", "last_accessed"):
+        return v.isoformat()
+    return v
+
+
+def _copy_flush(db: Session, batch: list[dict]) -> None:
+    """Load a batch via COPY ... FROM STDIN (CSV). None -> NULL; bool -> t/f."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    for d in batch:
+        writer.writerow([_copy_value(d, c) for c in _COPY_COLUMNS])
+    buf.seek(0)
+    sql = (
+        f"COPY nodes ({', '.join(_COPY_COLUMNS)}) "
+        "FROM STDIN WITH (FORMAT csv, NULL '')"
+    )
+    # Run on the session's own DBAPI connection so it shares the transaction.
+    raw = db.connection().connection
+    cur = raw.cursor()
+    try:
+        cur.copy_expert(sql, buf)
+    finally:
+        cur.close()
 
 
 def _find_parent(parent_key, folder_map):

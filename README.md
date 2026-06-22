@@ -14,10 +14,11 @@ Every change records who touched it and when.
 
 - **Handles scale.** Data lives in PostgreSQL with a materialized-path tree, so
   descendant counts and subtree queries stay fast at millions of rows. Uploads are
-  streamed to disk and imported in batches with **bounded memory** (~the file
-  size, not a multiple of it), so multi-GB exports don't exhaust the worker. A
-  large import can take several minutes and is held open for the request, so raise
-  your reverse proxy's body-size limit and read timeout (see below).
+  streamed to disk and bulk-loaded via Postgres `COPY` in batches with **bounded
+  memory** (~the file size, not a multiple of it), so multi-GB exports don't
+  exhaust the worker (~17k rows/s; a 2 GB / ~13M-row file ≈ 12–15 min). A large
+  import is held open for the request, so raise your reverse proxy's body-size
+  limit and read timeout (see below).
 - **Interactive tree explorer** with lazy loading, file-type filtering, and a
   last-accessed date range. Every folder shows its size and a **file counter
   that respects the active filters**.
@@ -63,6 +64,8 @@ A ready-made test dataset lives at `sample_data/fake_fileserver.csv`
 | `APP_PORT`          | `8000`         | Host port the web app is published on    |
 | `WEB_CONCURRENCY`   | `4`            | uvicorn worker processes                 |
 | `DATABASE_URL`      | (compose-set)  | Override to point at an external Postgres |
+| `IMPORT_BATCH_SIZE` | `50000`        | Rows per COPY batch during import (little effect above ~50k) |
+| `IMPORT_USE_COPY`   | `1`            | Use Postgres `COPY` for the bulk load (`0` falls back to ORM inserts) |
 
 ---
 
