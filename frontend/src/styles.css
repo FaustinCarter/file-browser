@@ -173,6 +173,15 @@ table.grid input.cell:focus { background: var(--bg); }
   flex-wrap: wrap;
 }
 
+.selectall-banner {
+  padding: 6px 12px;
+  background: #16303f;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+  text-align: center;
+}
+
 .modal-backdrop {
   position: fixed; inset: 0; background: rgba(0,0,0,0.6);
   display: flex; align-items: center; justify-content: center; z-index: 100;

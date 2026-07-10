@@ -17,6 +17,7 @@ from ..schemas import (
     FolderFlagUpdate,
     FolderStatsOut,
     FolderTypeCountRequest,
+    GridBulkUpdate,
     NodeOut,
     TypeBreakdownRow,
 )
@@ -62,30 +63,15 @@ def search(
     **effective** value (own or inherited from a parent folder). ``owner`` filters
     the read-only file-system owner from the CSV.
     """
-    f = services.build_filters(
-        db, dataset_id, no_transfer=no_transfer, processed=processed,
-        jira=jira, assignee=assignee,
-    )
-    conds = [Node.dataset_id == dataset_id]
-    if q:
-        conds.append(Node.full_path.ilike(f"%{q}%"))
-    if types:
-        conds.append(Node.file_type.in_(types))
-    if owner:
-        conds.append(Node.owner == owner)
-    if is_dir is not None:
-        conds.append(Node.is_dir.is_(is_dir))
-    if accessed_after:
-        conds.append(Node.last_accessed >= accessed_after)
-    if accessed_before:
-        conds.append(Node.last_accessed <= accessed_before)
-    if under_node_id is not None:
-        parent = db.get(Node, under_node_id)
-        if not parent:
-            raise HTTPException(status_code=404, detail="under_node_id not found")
-        conds.append(Node.mat_path.like(f"{parent.mat_path}%"))
-    if f["view_filter"] is not None:
-        conds.append(f["view_filter"])
+    try:
+        conds, f = services.grid_filter_conds(
+            db, dataset_id, q=q, types=types, owner=owner, is_dir=is_dir,
+            jira=jira, assignee=assignee, processed=processed,
+            no_transfer=no_transfer, accessed_after=accessed_after,
+            accessed_before=accessed_before, under_node_id=under_node_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
     stmt = select(Node).where(and_(*conds))
 
@@ -279,5 +265,39 @@ def bulk_annotation(
         accessed_before=payload.accessed_before,
         actor=actor,
     )
+    db.commit()
+    return {"updated": count}
+
+
+@router.post("/bulk-by-filter")
+def bulk_by_filter(
+    payload: GridBulkUpdate,
+    actor: str | None = Header(default=None, alias="X-Actor"),
+    db: Session = Depends(get_db),
+):
+    """Apply an edit to every row matching the grid filter (all pages at once)."""
+    values = payload.values.model_dump(exclude_unset=True)
+    if not values:
+        raise HTTPException(status_code=400, detail="No values provided")
+    try:
+        count = services.bulk_set_matching(
+            db,
+            dataset_id=payload.dataset_id,
+            values=values,
+            actor=actor,
+            q=payload.q,
+            types=payload.types,
+            owner=payload.owner,
+            is_dir=payload.is_dir,
+            jira=payload.jira,
+            assignee=payload.assignee,
+            processed=payload.processed,
+            no_transfer=payload.no_transfer,
+            accessed_after=payload.accessed_after,
+            accessed_before=payload.accessed_before,
+            under_node_id=payload.under_node_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     db.commit()
     return {"updated": count}

@@ -469,23 +469,93 @@ def bulk_set_under(
     node_ids = [
         r[0] for r in db.execute(select(Node.id).where(and_(*conds))).all()
     ]
-    if not node_ids:
-        return 0
+    return _apply_annotation_values(
+        db, folder.dataset_id, node_ids, values, actor
+    )
 
-    existing = {
-        a.node_id: a
-        for a in db.execute(
-            select(Annotation).where(Annotation.node_id.in_(node_ids))
-        ).scalars()
-    }
+
+def _apply_annotation_values(
+    db: Session, dataset_id: int, node_ids: list[int], values: dict,
+    actor: str | None, *, chunk: int = 5000,
+) -> int:
+    """Upsert ``values`` (+ audit) onto each node in ``node_ids``, in chunks."""
     clean = {k: v for k, v in values.items() if k in ANNOTATION_FIELDS}
-    for nid in node_ids:
-        ann = existing.get(nid)
-        if ann is None:
-            ann = Annotation(node_id=nid, dataset_id=folder.dataset_id)
-            db.add(ann)
-        for k, v in clean.items():
-            setattr(ann, k, v)
-        _stamp(ann, actor)
-    db.flush()
-    return len(node_ids)
+    if not node_ids or not clean:
+        return 0
+    total = 0
+    for i in range(0, len(node_ids), chunk):
+        part = node_ids[i:i + chunk]
+        existing = {
+            a.node_id: a
+            for a in db.execute(
+                select(Annotation).where(Annotation.node_id.in_(part))
+            ).scalars()
+        }
+        for nid in part:
+            ann = existing.get(nid)
+            if ann is None:
+                ann = Annotation(node_id=nid, dataset_id=dataset_id)
+                db.add(ann)
+            for k, v in clean.items():
+                setattr(ann, k, v)
+            _stamp(ann, actor)
+        db.flush()
+        total += len(part)
+    return total
+
+
+def grid_filter_conds(
+    db: Session,
+    dataset_id: int,
+    *,
+    q: str | None = None,
+    types: list[str] | None = None,
+    owner: str | None = None,
+    is_dir: bool | None = None,
+    jira: str | None = None,
+    assignee: str | None = None,
+    processed: str | None = None,
+    no_transfer: str | None = None,
+    accessed_after: date | None = None,
+    accessed_before: date | None = None,
+    under_node_id: int | None = None,
+) -> tuple[list, dict]:
+    """Build the WHERE conditions for the grid/search (shared by search + bulk).
+
+    Returns ``(conds, filters)`` where ``filters`` is the build_filters() result
+    (so callers can reuse its rollup clauses).
+    """
+    conds = [Node.dataset_id == dataset_id]
+    if q:
+        conds.append(Node.full_path.ilike(f"%{q}%"))
+    if types:
+        conds.append(Node.file_type.in_(list(types)))
+    if owner:
+        conds.append(Node.owner == owner)
+    if is_dir is not None:
+        conds.append(Node.is_dir.is_(is_dir))
+    if accessed_after:
+        conds.append(Node.last_accessed >= accessed_after)
+    if accessed_before:
+        conds.append(Node.last_accessed <= accessed_before)
+    if under_node_id is not None:
+        parent = db.get(Node, under_node_id)
+        if parent is None:
+            raise ValueError("under_node_id not found")
+        conds.append(Node.mat_path.like(f"{parent.mat_path}%"))
+    filters = build_filters(
+        db, dataset_id, no_transfer=no_transfer, processed=processed,
+        jira=jira, assignee=assignee,
+    )
+    if filters["view_filter"] is not None:
+        conds.append(filters["view_filter"])
+    return conds, filters
+
+
+def bulk_set_matching(
+    db: Session, *, dataset_id: int, values: dict, actor: str | None = None, **filters
+) -> int:
+    """Apply ``values`` to every node matching the grid filter (all pages)."""
+    conds, _ = grid_filter_conds(db, dataset_id, **filters)
+    node_ids = [r[0] for r in db.execute(select(Node.id).where(and_(*conds))).all()]
+    return _apply_annotation_values(db, dataset_id, node_ids, values, actor)

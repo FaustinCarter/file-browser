@@ -237,6 +237,23 @@ export const api = {
       headers: jsonHeaders(),
       body: JSON.stringify(payload),
     }).then((r) => j<{ updated: number }>(r)),
+
+  // Apply an edit to every row matching a grid filter (all pages at once).
+  bulkByFilter: (payload: {
+    dataset_id: number;
+    q?: string;
+    is_dir?: boolean;
+    jira?: string;
+    assignee?: string;
+    processed?: string;
+    no_transfer?: string;
+    values: Partial<Annotation>;
+  }) =>
+    fetch("/api/nodes/bulk-by-filter", {
+      method: "POST",
+      headers: jsonHeaders(),
+      body: JSON.stringify(payload),
+    }).then((r) => j<{ updated: number }>(r)),
 };
 
 export function fmtBytes(b: number | null | undefined): string {

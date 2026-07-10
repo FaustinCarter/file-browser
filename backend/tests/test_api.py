@@ -337,6 +337,39 @@ def test_distinct_values_endpoint(client, loaded):
     assert r["values"] == ["dave", "erin"]
 
 
+def test_bulk_by_filter_applies_to_all_matches(client, loaded):
+    ds = loaded
+    # Search for ".pptx" -> deck.pptx + notes.pptx (2 rows across the result set).
+    hits = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "q": ".pptx", "is_dir": False},
+    ).json()
+    assert hits["total"] == 2
+
+    # Apply an assignee to every matching row in one request.
+    r = client.post(
+        "/api/nodes/bulk-by-filter",
+        json={
+            "dataset_id": ds["id"],
+            "q": ".pptx",
+            "is_dir": False,
+            "values": {"assignee": "team-a"},
+        },
+        headers={"X-Actor": "carol"},
+    )
+    assert r.json()["updated"] == 2
+
+    # Both are now assignee=team-a; a non-match (data.xlsx) is untouched.
+    got = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "assignee": "team-a"},
+    ).json()
+    assert {i["name"] for i in got["items"]} == {"deck.pptx", "notes.pptx"}
+    assert all(i["updated_by"] == "carol" for i in got["items"])
+    xlsx = _find(client, ds["id"], "data.xlsx")
+    assert client.get(f"/api/nodes/{xlsx['id']}").json()["own"]["assignee"] is None
+
+
 def test_type_breakdown_respects_flag_filter(client, loaded):
     ds = loaded
     root = client.get("/api/tree/children", params={"dataset_id": ds["id"]}).json()["children"][0]

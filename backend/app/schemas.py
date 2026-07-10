@@ -123,6 +123,23 @@ class BulkAnnotationUpdate(BaseModel):
     values: AnnotationUpdate
 
 
+class GridBulkUpdate(BaseModel):
+    """Apply an annotation edit to every row matching the grid filter."""
+    dataset_id: int
+    q: str | None = None
+    types: list[str] | None = None
+    owner: str | None = None
+    is_dir: bool | None = None
+    jira: str | None = None
+    assignee: str | None = None
+    processed: str | None = None
+    no_transfer: str | None = None
+    accessed_after: date | None = None
+    accessed_before: date | None = None
+    under_node_id: int | None = None
+    values: AnnotationUpdate
+
+
 class FolderTypeCountRequest(BaseModel):
     """Answers: 'how many <type> files are in each of these folders?'"""
     node_ids: list[int]

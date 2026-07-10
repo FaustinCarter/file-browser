@@ -23,6 +23,7 @@ export default function GridView({ datasetId, toast }: Props) {
   const [sort, setSort] = useState("full_path");
   const [dir, setDir] = useState<"asc" | "desc">("asc");
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selectAllMatching, setSelectAllMatching] = useState(false);
   const [loading, setLoading] = useState(false);
 
   // filters
@@ -64,11 +65,30 @@ export default function GridView({ datasetId, toast }: Props) {
   };
 
   useEffect(load, [datasetId, page, sort, dir]);
-  // Reset to page 1 when filters change, then load.
+  // Selection resets when the dataset changes.
+  useEffect(() => {
+    setSelected(new Set());
+    setSelectAllMatching(false);
+  }, [datasetId]);
+
+  // Reset to page 1 + clear selection when filters change, then load.
   const applyFilters = () => {
+    setSelected(new Set());
+    setSelectAllMatching(false);
     if (page !== 1) setPage(1);
     else load();
   };
+
+  // Params describing the current result set (for "select all matching").
+  const filterParams = () => ({
+    dataset_id: datasetId,
+    q: q || undefined,
+    is_dir: isDir === "" ? undefined : isDir === "true",
+    no_transfer: noTransfer || undefined,
+    processed: processed || undefined,
+    jira: jira || undefined,
+    assignee: assignee || undefined,
+  });
 
   const setSortCol = (c: string) => {
     if (c === sort) setDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -84,14 +104,25 @@ export default function GridView({ datasetId, toast }: Props) {
     const s = new Set(selected);
     s.has(id) ? s.delete(id) : s.add(id);
     setSelected(s);
+    // Deviating from "all matching" drops back to an explicit selection.
+    setSelectAllMatching(false);
   };
   const allOnPage = items.length > 0 && items.every((i) => selected.has(i.id));
   const toggleAll = () => {
     const s = new Set(selected);
-    if (allOnPage) items.forEach((i) => s.delete(i.id));
-    else items.forEach((i) => s.add(i.id));
+    if (allOnPage) {
+      items.forEach((i) => s.delete(i.id));
+      setSelectAllMatching(false);
+    } else {
+      items.forEach((i) => s.add(i.id));
+    }
     setSelected(s);
   };
+  const clearSelection = () => {
+    setSelected(new Set());
+    setSelectAllMatching(false);
+  };
+  const selectedCount = selectAllMatching ? total : selected.size;
 
   async function patch(id: number, values: Partial<Annotation>) {
     try {
@@ -116,10 +147,19 @@ export default function GridView({ datasetId, toast }: Props) {
   }
 
   async function bulkApply(values: Partial<Annotation>) {
-    if (selected.size === 0) return;
     try {
-      await Promise.all(Array.from(selected).map((id) => api.updateAnnotation(id, values)));
-      toast(`Updated ${selected.size} rows`);
+      if (selectAllMatching) {
+        // One request applies to every matching row across all pages.
+        const r = await api.bulkByFilter({ ...filterParams(), values });
+        toast(`Updated ${r.updated.toLocaleString()} rows`);
+      } else {
+        if (selected.size === 0) return;
+        await Promise.all(
+          Array.from(selected).map((id) => api.updateAnnotation(id, values)),
+        );
+        toast(`Updated ${selected.size.toLocaleString()} rows`);
+      }
+      clearSelection();
       load();
     } catch (e: any) {
       toast(String(e.message || e), true);
@@ -196,7 +236,37 @@ export default function GridView({ datasetId, toast }: Props) {
       </div>
 
       {selected.size > 0 && (
-        <BulkBar count={selected.size} onApply={bulkApply} onClear={() => setSelected(new Set())} />
+        <BulkBar count={selectedCount} onApply={bulkApply} onClear={clearSelection} />
+      )}
+
+      {/* "Select all N matching" — spans every page of the current filter. */}
+      {selected.size > 0 && total > items.length && (
+        <div className="selectall-banner">
+          {selectAllMatching ? (
+            <>
+              All <b>{total.toLocaleString()}</b> rows matching this filter are
+              selected.{" "}
+              <a href="#" onClick={(e) => { e.preventDefault(); clearSelection(); }}>
+                Clear selection
+              </a>
+            </>
+          ) : (
+            allOnPage && (
+              <>
+                All {items.length} rows on this page are selected.{" "}
+                <a
+                  href="#"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setSelectAllMatching(true);
+                  }}
+                >
+                  Select all {total.toLocaleString()} matching
+                </a>
+              </>
+            )
+          )}
+        </div>
       )}
 
       <div style={{ overflow: "auto" }}>
@@ -204,7 +274,11 @@ export default function GridView({ datasetId, toast }: Props) {
           <thead>
             <tr>
               <th>
-                <input type="checkbox" checked={allOnPage} onChange={toggleAll} />
+                <input
+                  type="checkbox"
+                  checked={selectAllMatching || allOnPage}
+                  onChange={toggleAll}
+                />
               </th>
               <th onClick={() => setSortCol("name")}>Name</th>
               <th onClick={() => setSortCol("full_path")}>Full Path</th>
@@ -226,7 +300,7 @@ export default function GridView({ datasetId, toast }: Props) {
               <GridRow
                 key={n.id}
                 n={n}
-                selected={selected.has(n.id)}
+                selected={selectAllMatching || selected.has(n.id)}
                 onToggle={() => toggleSel(n.id)}
                 onPatch={patch}
                 onFlag={setFlag}
