@@ -189,6 +189,10 @@ export const api = {
         types: filters.types,
         accessed_after: filters.accessed_after,
         accessed_before: filters.accessed_before,
+        no_transfer: filters.no_transfer,
+        processed: filters.processed,
+        jira: filters.jira,
+        assignee: filters.assignee,
         search,
       })}`,
     ).then((r) =>

@@ -337,6 +337,29 @@ def test_distinct_values_endpoint(client, loaded):
     assert r["values"] == ["dave", "erin"]
 
 
+def test_type_breakdown_respects_flag_filter(client, loaded):
+    ds = loaded
+    root = client.get("/api/tree/children", params={"dataset_id": ds["id"]}).json()["children"][0]
+    reports = _find(client, ds["id"], "Reports")
+
+    base = client.get(f"/api/nodes/{root['id']}/type-breakdown").json()
+    by = {r["file_type"]: r["count"] for r in base}
+    assert by.get("PPTX File") == 2 and by.get("JPG File") == 1
+
+    # Mark the whole Reports subtree no_transfer, then hide marked files.
+    client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True},
+    )
+    hidden = client.get(
+        f"/api/nodes/{root['id']}/type-breakdown", params={"no_transfer": "no"}
+    ).json()
+    by2 = {r["file_type"]: r["count"] for r in hidden}
+    # Reports files (2 PPTX + 1 XLSX) are gone; only the Images files remain.
+    assert "PPTX File" not in by2 and "XLSX File" not in by2
+    assert by2.get("JPG File") == 1 and by2.get("PNG File") == 1
+
+
 def test_search_filters_and_pagination(client, loaded):
     ds = loaded
     r = client.get(

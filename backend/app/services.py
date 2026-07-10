@@ -334,15 +334,22 @@ def type_breakdown(
     db: Session,
     node: Node,
     *,
-    types: list[str] | None = None,
-    accessed_after: date | None = None,
-    accessed_before: date | None = None,
+    view_filter=None,
     search: str | None = None,
 ) -> list[dict]:
-    """File-type histogram (count + total size) for files under ``node``."""
-    conds = _descendant_files_filter(
-        node, types=types, accessed_after=accessed_after, accessed_before=accessed_before
-    )
+    """File-type histogram (count + total size) for files under ``node``.
+
+    ``view_filter`` is the combined filter clause (type / last-accessed / flags /
+    assignee / jira) so the breakdown matches the folder's filtered file count.
+    """
+    conds = [
+        Node.dataset_id == node.dataset_id,
+        Node.mat_path.like(f"{node.mat_path}%"),
+        Node.id != node.id,
+        Node.is_dir.is_(False),
+    ]
+    if view_filter is not None:
+        conds.append(view_filter)
     if search:
         conds.append(Node.file_type.ilike(f"%{search}%"))
     stmt: Select = (

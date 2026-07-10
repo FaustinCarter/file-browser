@@ -173,16 +173,22 @@ def type_breakdown(
     types: list[str] | None = Query(None),
     accessed_after: date | None = Query(None),
     accessed_before: date | None = Query(None),
+    no_transfer: str | None = Query(None),
+    processed: str | None = Query(None),
+    jira: str | None = Query(None),
+    assignee: str | None = Query(None),
     search: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
     node = db.get(Node, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-    return services.type_breakdown(
-        db, node, types=types, accessed_after=accessed_after,
-        accessed_before=accessed_before, search=search,
+    f = services.build_filters(
+        db, node.dataset_id, types=types, accessed_after=accessed_after,
+        accessed_before=accessed_before, no_transfer=no_transfer,
+        processed=processed, jira=jira, assignee=assignee,
     )
+    return services.type_breakdown(db, node, view_filter=f["view_filter"], search=search)
 
 
 @router.patch("/{node_id}/annotation", response_model=NodeOut)
