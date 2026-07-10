@@ -5,6 +5,25 @@ services:
     platform: linux/amd64
     # Offline host: never reach a registry; use the locally loaded image.
     pull_policy: never
+    # Tuning: the stock image is sized for a tiny box. These defaults are safe
+    # on a modest host; bump them (esp. shared_buffers, the parallel workers) via
+    # .env for a big server — see .env.example.
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=${PG_SHARED_BUFFERS:-512MB}"
+      - "-c"
+      - "effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-2GB}"
+      - "-c"
+      - "work_mem=${PG_WORK_MEM:-64MB}"
+      - "-c"
+      - "maintenance_work_mem=${PG_MAINTENANCE_WORK_MEM:-256MB}"
+      - "-c"
+      - "max_worker_processes=${PG_MAX_WORKER_PROCESSES:-8}"
+      - "-c"
+      - "max_parallel_workers=${PG_MAX_PARALLEL_WORKERS:-8}"
+      - "-c"
+      - "max_parallel_workers_per_gather=${PG_MAX_PARALLEL_WORKERS_PER_GATHER:-4}"
     environment:
       POSTGRES_USER: filebrowser
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-filebrowser}

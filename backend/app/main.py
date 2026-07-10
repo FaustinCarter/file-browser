@@ -66,6 +66,33 @@ def _init_schema():
         # create_all is a no-op for existing tables; runs inside the same lock.
         Base.metadata.create_all(bind=conn)
 
+    _maybe_build_trgm_index(is_pg)
+
+
+def _maybe_build_trgm_index(is_pg: bool):
+    """Optional trigram index for fast 'path contains' search (opt-in).
+
+    Kept in its own transaction (so a failure — e.g. a managed Postgres where the
+    role can't CREATE EXTENSION — degrades to a sequential scan instead of
+    aborting schema setup) and serialized with the schema advisory lock.
+    """
+    if not is_pg or os.environ.get("ENABLE_TRGM_INDEX", "").lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _SCHEMA_LOCK_KEY})
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_nodes_fullpath_trgm "
+                    "ON nodes USING gin (full_path gin_trgm_ops)"
+                )
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"trigram index unavailable, skipping ({e})")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

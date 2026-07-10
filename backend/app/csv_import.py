@@ -227,6 +227,17 @@ def _run(db: Session, *, name: str, filename: str, opener) -> Dataset:
             {"v": next_id},
         )
     db.commit()
+
+    # Refresh planner statistics so queries over the new rows get good plans
+    # immediately (rather than waiting for autovacuum's autoanalyze).
+    if db.bind.dialect.name == "postgresql":
+        try:
+            with db.bind.connect().execution_options(
+                isolation_level="AUTOCOMMIT"
+            ) as conn:
+                conn.execute(text("ANALYZE nodes"))
+        except Exception:
+            pass
     return dataset
 
 

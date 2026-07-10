@@ -127,6 +127,42 @@ The web container creates its database on startup if it's missing, so a normal
 
 ---
 
+## Performance & tuning
+
+The stock `postgres` image is configured for a tiny machine, so on a real server
+it uses a fraction of the hardware. The compose `db` service applies safe
+defaults and exposes the important knobs via env (see `.env.example`). The big
+one for "use more CPUs" is **parallel query** — a single heavy scan/aggregate
+only spreads across cores when parallel workers are enabled:
+
+```env
+# .env  — example for ~64 GB RAM / 16 CPU
+PG_SHARED_BUFFERS=16GB              # ~25% of RAM (actual cache)
+PG_EFFECTIVE_CACHE_SIZE=48GB        # ~50-75% of RAM (planner hint)
+PG_WORK_MEM=256MB                   # per sort/hash; raises group-by/sort speed
+PG_MAINTENANCE_WORK_MEM=2GB         # faster index builds
+PG_MAX_WORKER_PROCESSES=16
+PG_MAX_PARALLEL_WORKERS=16
+PG_MAX_PARALLEL_WORKERS_PER_GATHER=8   # a single query can use up to 8 cores
+```
+
+Other levers:
+
+- **Fresh stats after import.** The importer runs `ANALYZE` automatically so
+  queries over newly loaded data get good plans immediately.
+- **Fast "path contains" search.** Set `ENABLE_TRGM_INDEX=1` to build a
+  `pg_trgm` GIN index on `full_path`. Substring search then uses an index scan
+  instead of scanning the table (≈3× faster at 600k rows, far more at millions).
+  Trade-off: imports run ~40% slower while the index is maintained, and the role
+  must be able to `CREATE EXTENSION` (falls back gracefully if not).
+- **Scale out.** The app is stateless, so you can raise `WEB_CONCURRENCY` or run
+  multiple `web` replicas behind the reverse proxy against the one database.
+
+After changing `.env`, `docker compose up -d` recreates the containers with the
+new settings (no rebuild needed for DB tuning).
+
+---
+
 ## Local development (without Docker)
 
 **Backend** (needs a reachable PostgreSQL):
