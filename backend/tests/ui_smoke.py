@@ -21,7 +21,7 @@ def run():
 
         # 1. Name prompt
         page.wait_for_selector("text=Welcome")
-        page.fill("input[placeholder='e.g. Faustin']", "Faustin")
+        page.fill("input[placeholder='e.g. fwcarter']", "fwcarter")
         page.click("text=Continue")
 
         # 2. Tree explorer loads with root

@@ -197,7 +197,7 @@ function NamePrompt({ onSet }: { onSet: (n: string) => void }) {
         <input
           autoFocus
           style={{ width: "100%", marginBottom: 12 }}
-          placeholder="e.g. Faustin"
+          placeholder="e.g. fwcarter"
           value={name}
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && name.trim() && onSet(name.trim())}

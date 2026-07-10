@@ -31,7 +31,7 @@ def main():
 
         page.goto(UI)
         page.wait_for_selector("text=Welcome")
-        page.fill("input[placeholder='e.g. Faustin']", "Carol")
+        page.fill("input[placeholder='e.g. fwcarter']", "Carol")
         page.click("text=Continue")
         page.wait_for_selector("text=FileServer")
 
