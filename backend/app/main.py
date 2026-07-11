@@ -57,10 +57,16 @@ def _init_schema():
                 # new editable assignee column
                 if not col("assignee"):
                     conn.execute(text("ALTER TABLE annotations ADD COLUMN assignee text"))
+                # indexes that speed effective-value filtering (created for
+                # existing tables; create_all handles fresh ones).
+                for name, cols in (
+                    ("ix_annotations_assignee", "dataset_id, assignee"),
+                    ("ix_annotations_no_transfer", "dataset_id, no_transfer"),
+                    ("ix_annotations_processed", "dataset_id, processed"),
+                ):
                     conn.execute(
                         text(
-                            "CREATE INDEX IF NOT EXISTS ix_annotations_assignee "
-                            "ON annotations (dataset_id, assignee)"
+                            f"CREATE INDEX IF NOT EXISTS {name} ON annotations ({cols})"
                         )
                     )
         # create_all is a no-op for existing tables; runs inside the same lock.

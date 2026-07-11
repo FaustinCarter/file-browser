@@ -131,4 +131,6 @@ class Annotation(Base):
         Index("ix_annotations_dataset", "dataset_id"),
         Index("ix_annotations_jira", "dataset_id", "jira_ticket"),
         Index("ix_annotations_assignee", "dataset_id", "assignee"),
+        Index("ix_annotations_no_transfer", "dataset_id", "no_transfer"),
+        Index("ix_annotations_processed", "dataset_id", "processed"),
     )

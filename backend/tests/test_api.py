@@ -370,6 +370,60 @@ def test_bulk_by_filter_applies_to_all_matches(client, loaded):
     assert client.get(f"/api/nodes/{xlsx['id']}").json()["own"]["assignee"] is None
 
 
+def _upload_many_files(client, n=200):
+    header = (
+        "Name,Full Path,Size,Allocated,Files,Folders,% of Parent (Allocated),"
+        "Last Modified,Last Accessed,Owner,Type,Dir Level (Relative)"
+    )
+    lines = [header, "Root,C:\\Root\\,1 GB,1 GB," + f"{n},0,100 %,01/01/2024,01/01/2024,a,File Folder,0"]
+    for i in range(n):
+        lines.append(
+            f"f{i}.txt,C:\\Root\\f{i}.txt,1 MB,1 MB,1,0,0.1 %,01/01/2024,01/01/2024,a,Text File,1"
+        )
+    csv = "\n".join(lines) + "\n"
+    return client.post("/api/datasets", files={"file": ("m.csv", csv, "text/csv")}).json()
+
+
+def test_effective_filter_bounded_with_many_file_overrides(client):
+    """Regression: applying a flag to many files must not build a per-file clause
+    explosion (which crashed later queries with 'query is too long')."""
+    ds = _upload_many_files(client, 200)
+    dsid = ds["id"]
+
+    # Apply no_transfer to all 200 files in one bulk-by-filter call.
+    r = client.post(
+        "/api/nodes/bulk-by-filter",
+        json={"dataset_id": dsid, "is_dir": False, "values": {"no_transfer": True}},
+    )
+    assert r.json()["updated"] == 200
+
+    # The generated effective clause must be bounded (own-value via subquery, not
+    # 200 LIKE terms).
+    from app.database import SessionLocal
+    from app.services import effective_true_clause
+
+    db = SessionLocal()
+    try:
+        sql = str(effective_true_clause(db, dsid, "no_transfer"))
+        assert sql.upper().count(" LIKE ") == 0, sql  # no per-file LIKE
+    finally:
+        db.close()
+
+    # And subsequent queries (which build nt_clause) work and are correct.
+    root = client.get("/api/tree/children", params={"dataset_id": dsid}).json()["children"][0]
+    assert root["total_files"] == 200 and root["no_transfer_marked"] == 200
+    hidden = client.get(
+        "/api/tree/children",
+        params={"dataset_id": dsid, "parent_id": root["id"], "no_transfer": "no"},
+    ).json()["children"]
+    assert hidden == []  # every file marked -> none visible
+    only = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": dsid, "is_dir": False, "no_transfer": "yes", "page_size": 1},
+    ).json()
+    assert only["total"] == 200
+
+
 def test_type_breakdown_respects_flag_filter(client, loaded):
     ds = loaded
     root = client.get("/api/tree/children", params={"dataset_id": ds["id"]}).json()["children"][0]

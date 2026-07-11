@@ -3,18 +3,14 @@ from __future__ import annotations
 
 from datetime import date
 
-from datetime import datetime, timezone
-
 from sqlalchemy import (
     Select,
     and_,
-    false as sa_false,
     func,
     literal,
     not_,
     or_,
     select,
-    true as sa_true,
     update,
 )
 from sqlalchemy.orm import Session
@@ -38,14 +34,38 @@ BOOLEAN_FLAG_FIELDS = ("processed", "no_transfer")
 UNASSIGNED = "__none__"
 
 
-def _override_paths(db: Session, dataset_id: int, field: str):
-    """Return ``[(mat_path, value), ...]`` for every node that sets ``field``."""
+# Effective-value filtering.
+#
+# A node's effective value for a field is its own value, else the value inherited
+# from the nearest ancestor. Ancestors are always folders (files are leaves), so
+# a *file* override only ever affects itself. That lets us keep the generated SQL
+# small no matter how many rows are annotated:
+#   * "own value" is checked with a single subquery (IN / NOT IN annotations),
+#     so applying a flag to 145k files doesn't produce 145k clauses; and
+#   * inheritance is expressed as materialized-path regions over *folder*
+#     overrides only (of which there are few).
+
+
+def _folder_overrides(db: Session, dataset_id: int, field: str):
+    """``[(mat_path, value), ...]`` for the folders that set ``field`` (few)."""
     col = getattr(Annotation, field)
     return db.execute(
         select(Node.mat_path, col)
         .join(Annotation, Annotation.node_id == Node.id)
-        .where(Annotation.dataset_id == dataset_id, col.isnot(None))
+        .where(
+            Annotation.dataset_id == dataset_id,
+            col.isnot(None),
+            Node.is_dir.is_(True),
+        )
     ).all()
+
+
+def _own_ids(dataset_id: int, field: str, *, value=..., notnull: bool = False):
+    col = getattr(Annotation, field)
+    q = select(Annotation.node_id).where(Annotation.dataset_id == dataset_id)
+    if notnull:
+        return q.where(col.isnot(None))
+    return q.where(col == value)
 
 
 def _direct_children(paths: list[str]) -> dict[str, list[str]]:
@@ -62,20 +82,18 @@ def _direct_children(paths: list[str]) -> dict[str, list[str]]:
     return direct
 
 
-def effective_equals_clause(db: Session, dataset_id: int, field: str, value):
-    """SQL expression: true for nodes whose *effective* ``field`` equals ``value``.
+def _folder_region_clause(folders: list, value):
+    """OR of the subtree regions governed by a folder override with ``value``.
 
-    Built from the sparse override set as an O(overrides) materialized-path
-    expression (no per-row subquery / recursive CTE). Each matching override
-    contributes its subtree minus the subtrees of its nearest descendant
-    overrides (which are governed by a deeper value).
+    Each matching folder contributes its subtree minus the subtrees of its
+    nearest descendant folder overrides (governed by a deeper value). Returns
+    None if no folder sets ``value``.
     """
-    rows = _override_paths(db, dataset_id, field)
-    if not rows:
-        return sa_false()
-    direct = _direct_children([mp for mp, _ in rows])
+    if not folders:
+        return None
+    direct = _direct_children([mp for mp, _ in folders])
     clauses = []
-    for mp, v in rows:
+    for mp, v in folders:
         if v != value:
             continue
         region = Node.mat_path.like(mp + "%")
@@ -83,17 +101,28 @@ def effective_equals_clause(db: Session, dataset_id: int, field: str, value):
         if kids:
             region = and_(region, not_(or_(*[Node.mat_path.like(k + "%") for k in kids])))
         clauses.append(region)
-    return or_(*clauses) if clauses else sa_false()
+    return or_(*clauses) if clauses else None
+
+
+def effective_equals_clause(db: Session, dataset_id: int, field: str, value):
+    """SQL expression: true for nodes whose *effective* ``field`` equals ``value``."""
+    own_match = Node.id.in_(_own_ids(dataset_id, field, value=value))
+    region = _folder_region_clause(_folder_overrides(db, dataset_id, field), value)
+    if region is None:
+        return own_match
+    # Inherited only where the node has no own value of its own.
+    own_is_null = Node.id.notin_(_own_ids(dataset_id, field, notnull=True))
+    return or_(own_match, and_(own_is_null, region))
 
 
 def effective_isnull_clause(db: Session, dataset_id: int, field: str):
     """SQL expression: true for nodes with no effective value for ``field``."""
-    rows = _override_paths(db, dataset_id, field)
-    if not rows:
-        return sa_true()  # nothing sets it -> everything is unassigned
-    # A node has *some* value iff it sits under any override path.
-    has_value = or_(*[Node.mat_path.like(mp + "%") for mp, _ in rows])
-    return not_(has_value)
+    own_is_null = Node.id.notin_(_own_ids(dataset_id, field, notnull=True))
+    folders = _folder_overrides(db, dataset_id, field)
+    if not folders:
+        return own_is_null
+    not_under_folder = not_(or_(*[Node.mat_path.like(mp + "%") for mp, _ in folders]))
+    return and_(own_is_null, not_under_folder)
 
 
 def effective_true_clause(db: Session, dataset_id: int, field: str):
