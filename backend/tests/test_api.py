@@ -397,15 +397,16 @@ def test_effective_filter_bounded_with_many_file_overrides(client):
     )
     assert r.json()["updated"] == 200
 
-    # The generated effective clause must be bounded (own-value via subquery, not
-    # 200 LIKE terms).
+    # The effective clause is a recursive CTE (O(nodes)), never a per-override
+    # LIKE explosion, so its SQL is bounded no matter how many rows are flagged.
     from app.database import SessionLocal
     from app.services import effective_true_clause
 
     db = SessionLocal()
     try:
-        sql = str(effective_true_clause(db, dsid, "no_transfer"))
-        assert sql.upper().count(" LIKE ") == 0, sql  # no per-file LIKE
+        sql = str(effective_true_clause(db, dsid, "no_transfer")).upper()
+        assert " LIKE " not in sql, sql       # no per-file LIKE
+        assert "RECURSIVE" in sql             # resolved via the tree walk
     finally:
         db.close()
 
@@ -458,8 +459,8 @@ def test_bulk_by_filter_files_only_marks_files_not_folders(client):
 
 
 def test_effective_clause_bounded_with_many_folder_overrides(client):
-    """Many folder overrides must collapse into a bounded clause (LIKE ANY), not
-    one LIKE per folder."""
+    """Many folder overrides must not grow the effective clause: the recursive
+    CTE resolves inheritance in one tree walk, so there is no per-folder LIKE."""
     ds = _upload_folders(client, 40, files_each=2)
     dsid = ds["id"]
     folders = client.get(
@@ -477,7 +478,8 @@ def test_effective_clause_bounded_with_many_folder_overrides(client):
     db = SessionLocal()
     try:
         sql = str(effective_true_clause(db, dsid, "no_transfer")).upper()
-        assert sql.count(" LIKE ") <= 2, sql  # collapsed, not 40 terms
+        assert " LIKE " not in sql, sql  # no per-folder LIKE at all
+        assert "RECURSIVE" in sql
     finally:
         db.close()
 
@@ -486,6 +488,81 @@ def test_effective_clause_bounded_with_many_folder_overrides(client):
         params={"dataset_id": dsid, "is_dir": False, "no_transfer": "yes", "page_size": 1},
     ).json()
     assert g["total"] == 80  # 40 folders x 2 files all effectively marked
+
+
+def test_effective_cte_matches_resolve_effective(client, loaded):
+    """Golden equivalence: the recursive-CTE effective values equal the Python
+    reference (resolve_effective) for every node and every field.
+
+    Guards nearest-ancestor precedence (Reports flips Root's flag), empty-string
+    text treated as no-value (inherits through), and file-leaf semantics (a file
+    override never propagates)."""
+    dsid = loaded["id"]
+    items = client.get(
+        "/api/nodes/search", params={"dataset_id": dsid, "page_size": 1000}
+    ).json()["items"]
+    by_name = {i["name"]: i for i in items}
+
+    def patch(name, **vals):
+        r = client.patch(f"/api/nodes/{by_name[name]['id']}/annotation", json=vals)
+        assert r.status_code == 200, r.text
+
+    patch("Root", no_transfer=True, jira_ticket="ROOT-1", assignee="alice")
+    patch("Reports", no_transfer=False, jira_ticket="")  # empty -> inherit ROOT-1
+    patch("deck.pptx", processed=True, assignee="bob")
+    patch("a.jpg", jira_ticket="IMG-9")
+
+    from sqlalchemy import select
+
+    from app import services
+    from app.database import SessionLocal
+    from app.models import Node
+
+    db = SessionLocal()
+    try:
+        cte = services.effective_cte(dsid)
+        cols = [cte.c[f"{f}_eff"] for f in services.ANNOTATION_FIELDS]
+        rows = db.execute(select(cte.c.id, *cols)).all()
+        cte_eff = {
+            r[0]: {f: r[i + 1] for i, f in enumerate(services.ANNOTATION_FIELDS)}
+            for r in rows
+        }
+
+        nodes = list(db.execute(select(Node).where(Node.dataset_id == dsid)).scalars())
+        ref = services.resolve_effective(db, nodes)
+        assert set(cte_eff) == {n.id for n in nodes}  # CTE covers every node
+        for n in nodes:
+            for f in services.ANNOTATION_FIELDS:
+                assert cte_eff[n.id][f] == ref[n.id]["effective"][f], (n.name, f)
+    finally:
+        db.close()
+
+
+def test_folder_rollups_are_one_query_not_n_plus_1(client):
+    """Rendering a page of K folders must issue a constant number of queries
+    (one batched rollup), not one rollup query per folder."""
+    from sqlalchemy import event
+
+    from app.database import engine
+
+    def query_count(nfolders):
+        ds = _upload_folders(client, nfolders, files_each=2)
+        counter = {"n": 0}
+
+        def before(conn, cursor, statement, *a):
+            counter["n"] += 1
+
+        event.listen(engine, "before_cursor_execute", before)
+        try:
+            client.get(
+                "/api/nodes/search",
+                params={"dataset_id": ds["id"], "is_dir": True, "page_size": 1000},
+            ).json()
+        finally:
+            event.remove(engine, "before_cursor_execute", before)
+        return counter["n"]
+
+    assert query_count(5) == query_count(50)  # flat in folder count
 
 
 def test_type_breakdown_respects_flag_filter(client, loaded):

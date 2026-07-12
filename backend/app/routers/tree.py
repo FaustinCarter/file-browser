@@ -58,8 +58,9 @@ def children(
         ).scalars().all()
     )
     file_conds = [Node.dataset_id == dataset_id, parent_cond, Node.is_dir.is_(False)]
-    if f["view_filter"] is not None:
-        file_conds.append(f["view_filter"])
+    file_view = f["view_filter"].build(Node)
+    if file_view is not None:
+        file_conds.append(file_view)
     files = list(
         db.execute(
             select(Node).where(and_(*file_conds)).order_by(func.lower(Node.name))
@@ -67,8 +68,7 @@ def children(
     )
 
     folder_outs = build_node_outs(
-        db, folders, view_filter=f["view_filter"], nt_clause=f["nt_clause"],
-        proc_clause=f["proc_clause"],
+        db, folders, cte=f["cte"], view_filter=f["view_filter"],
     )
     if f["filter_active"]:
         folder_outs = [fo for fo in folder_outs if (fo.filtered_file_count or 0) > 0]

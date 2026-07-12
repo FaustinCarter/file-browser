@@ -27,15 +27,26 @@ def build_node_outs(
     db: Session,
     nodes: list[Node],
     *,
+    cte=None,
     view_filter=None,
-    nt_clause=None,
-    proc_clause=None,
     with_folder_stats: bool = True,
 ) -> list[NodeOut]:
     if not nodes:
         return []
     eff_map = services.resolve_effective(db, nodes)
     has_kids = _children_presence(db, [n.id for n in nodes])
+
+    # One batched rollup query for every directory in this page (not one per
+    # folder). The rollups always need the effective-value CTE for their marked
+    # counts, so build one if the caller didn't pass a shared one.
+    metrics: dict[int, dict] = {}
+    if with_folder_stats:
+        dirs = [n for n in nodes if n.is_dir]
+        if dirs:
+            rollup_cte = cte if cte is not None else services.effective_cte(dirs[0].dataset_id)
+            metrics = services.folder_metrics_bulk(
+                db, dirs, cte=rollup_cte, view_filter=view_filter
+            )
 
     out: list[NodeOut] = []
     for n in nodes:
@@ -75,14 +86,12 @@ def build_node_outs(
             updated_by=info["updated_by"],
         )
         if n.is_dir and with_folder_stats:
-            m = services.folder_metrics(
-                db, n, view_filter=view_filter, nt_clause=nt_clause,
-                proc_clause=proc_clause,
-            )
-            item.filtered_file_count = m["filtered_file_count"]
-            item.filtered_total_size = m["filtered_total_size"]
-            item.total_files = m["total_files"]
-            item.no_transfer_marked = m["no_transfer_marked"]
-            item.processed_marked = m["processed_marked"]
+            m = metrics.get(n.id)
+            if m is not None:
+                item.filtered_file_count = m["filtered_file_count"]
+                item.filtered_total_size = m["filtered_total_size"]
+                item.total_files = m["total_files"]
+                item.no_transfer_marked = m["no_transfer_marked"]
+                item.processed_marked = m["processed_marked"]
         out.append(item)
     return out

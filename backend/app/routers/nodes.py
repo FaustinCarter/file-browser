@@ -84,9 +84,8 @@ def search(
     stmt = stmt.order_by(col).offset((page - 1) * page_size).limit(page_size)
 
     nodes = list(db.execute(stmt).scalars().all())
-    items = build_node_outs(
-        db, nodes, nt_clause=f["nt_clause"], proc_clause=f["proc_clause"],
-    )
+    # Flat grid: folder rows show total (unfiltered) rollups, so no view_filter.
+    items = build_node_outs(db, nodes, cte=f["cte"])
     return {"total": int(total), "page": page, "page_size": page_size, "items": items}
 
 
@@ -115,9 +114,7 @@ def folder_type_counts(req: FolderTypeCountRequest, db: Session = Depends(get_db
 
 def _single_node_out(db: Session, node: Node) -> NodeOut:
     f = services.build_filters(db, node.dataset_id)
-    return build_node_outs(
-        db, [node], nt_clause=f["nt_clause"], proc_clause=f["proc_clause"]
-    )[0]
+    return build_node_outs(db, [node], cte=f["cte"])[0]
 
 
 @router.get("/{node_id}", response_model=NodeOut)

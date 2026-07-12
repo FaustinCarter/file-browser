@@ -5,30 +5,16 @@ from datetime import date
 
 from sqlalchemy import (
     Select,
-    Text as SAText,
     and_,
-    any_,
     func,
-    literal,
     not_,
-    or_,
     select,
     update,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from .models import Annotation, Node
 
-
-def _like_any(patterns: list[str]):
-    """``mat_path LIKE ANY(ARRAY[...])`` as a single bound-array parameter.
-
-    Collapses many prefix matches into one expression, so the generated SQL stays
-    tiny no matter how many folders are annotated (the array is a bind param, not
-    inlined text).
-    """
-    return Node.mat_path.like(any_(literal(patterns, ARRAY(SAText))))
 
 # Editable, inheritable annotation fields.
 ANNOTATION_FIELDS = (
@@ -43,114 +29,91 @@ ANNOTATION_FIELDS = (
 # Booleans that use the folder rollup / hide-filter behaviour.
 BOOLEAN_FLAG_FIELDS = ("processed", "no_transfer")
 
+# Text (string) annotation fields, where empty string == "no value".
+TEXT_FIELDS = ("target_location", "jira_ticket", "comment", "assignee")
+
 # Sentinel meaning "filter to records with no effective value for this field".
 UNASSIGNED = "__none__"
 
 
-# Effective-value filtering.
+# Effective-value resolution via a recursive CTE.
 #
 # A node's effective value for a field is its own value, else the value inherited
-# from the nearest ancestor. Ancestors are always folders (files are leaves), so
-# a *file* override only ever affects itself. That lets us keep the generated SQL
-# small no matter how many rows are annotated:
-#   * "own value" is checked with a single subquery (IN / NOT IN annotations),
-#     so applying a flag to 145k files doesn't produce 145k clauses; and
-#   * inheritance is expressed as materialized-path regions over *folder*
-#     overrides only (of which there are few).
+# from the nearest ancestor folder (files are leaves, so a file override only ever
+# affects itself). We resolve this with a single top-down tree walk by parent_id:
+# each child COALESCEs its own value over its parent's already-resolved value. The
+# walk visits every node once (O(nodes)), independent of how many overrides exist,
+# so filtering/rollups stay fast no matter how much has been annotated. Filters and
+# rollups then reference the CTE as a set (``node.id IN (SELECT id FROM eff ...)``).
 
 
-def _folder_overrides(db: Session, dataset_id: int, field: str):
-    """``[(mat_path, value), ...]`` for the folders that set ``field`` (few)."""
-    col = getattr(Annotation, field)
-    return db.execute(
-        select(Node.mat_path, col)
-        .join(Annotation, Annotation.node_id == Node.id)
-        .where(
-            Annotation.dataset_id == dataset_id,
-            col.isnot(None),
-            Node.is_dir.is_(True),
+def _own_expr(ann, field):
+    """Own value of ``field``, with empty-string text normalised to NULL.
+
+    Matching ``resolve_effective``'s ``v != ""`` rule keeps SQL inheritance and the
+    Python reference in lock-step (see the equivalence test)."""
+    col = getattr(ann, field)
+    return func.nullif(col, "") if field in TEXT_FIELDS else col
+
+
+def effective_cte(dataset_id: int):
+    """Recursive CTE with one row per node: ``id`` + a ``<field>_eff`` column per
+    inheritable field, holding that node's effective value."""
+    a0 = aliased(Annotation)
+    anchor = (
+        select(
+            Node.id.label("id"),
+            *[_own_expr(a0, f).label(f"{f}_eff") for f in ANNOTATION_FIELDS],
         )
-    ).all()
+        .select_from(Node)
+        .join(a0, a0.node_id == Node.id, isouter=True)
+        .where(Node.dataset_id == dataset_id, Node.parent_id.is_(None))
+    )
+    eff = anchor.cte("eff", recursive=True)
+    child = aliased(Node)
+    ac = aliased(Annotation)
+    rec = (
+        select(
+            child.id.label("id"),
+            *[
+                func.coalesce(_own_expr(ac, f), eff.c[f"{f}_eff"]).label(f"{f}_eff")
+                for f in ANNOTATION_FIELDS
+            ],
+        )
+        .select_from(eff)
+        .join(child, and_(child.parent_id == eff.c.id, child.dataset_id == dataset_id))
+        .join(ac, ac.node_id == child.id, isouter=True)
+    )
+    return eff.union_all(rec)
 
 
-def _own_ids(dataset_id: int, field: str, *, value=..., notnull: bool = False):
-    col = getattr(Annotation, field)
-    q = select(Annotation.node_id).where(Annotation.dataset_id == dataset_id)
-    if notnull:
-        return q.where(col.isnot(None))
-    return q.where(col == value)
+def eff_true_pred(node, cte, field):
+    """Predicate: ``node``'s effective ``field`` is boolean True."""
+    return node.id.in_(select(cte.c.id).where(cte.c[f"{field}_eff"].is_(True)))
 
 
-def _direct_children(paths: list[str]) -> dict[str, list[str]]:
-    """Map each override path to its nearest descendant override paths."""
-    paths = sorted(paths)
-    direct: dict[str, list[str]] = {p: [] for p in paths}
-    stack: list[str] = []
-    for p in paths:
-        while stack and not p.startswith(stack[-1]):
-            stack.pop()
-        if stack:
-            direct[stack[-1]].append(p)
-        stack.append(p)
-    return direct
+def eff_equals_pred(node, cte, field, value):
+    """Predicate: ``node``'s effective ``field`` equals ``value``."""
+    return node.id.in_(select(cte.c.id).where(cte.c[f"{field}_eff"] == value))
 
 
-def _folder_region_clause(folders: list, value):
-    """OR of the subtree regions governed by a folder override with ``value``.
-
-    Each matching folder contributes its subtree minus the subtrees of its
-    nearest descendant folder overrides (governed by a deeper value). Folders with
-    no nested override (the common case) are collapsed into one ``LIKE ANY`` array
-    so the clause stays small even with tens of thousands of annotated folders.
-    Returns None if no folder sets ``value``.
-    """
-    if not folders:
-        return None
-    direct = _direct_children([mp for mp, _ in folders])
-    simple: list[str] = []  # regions with no nested override -> collapsible
-    clauses = []            # regions needing a "minus nested override" cut
-    for mp, v in folders:
-        if v != value:
-            continue
-        kids = direct.get(mp, [])
-        if kids:
-            clauses.append(
-                and_(
-                    Node.mat_path.like(mp + "%"),
-                    not_(_like_any([k + "%" for k in kids])),
-                )
-            )
-        else:
-            simple.append(mp + "%")
-    if simple:
-        clauses.append(_like_any(simple))
-    return or_(*clauses) if clauses else None
+def eff_isnull_pred(node, cte, field):
+    """Predicate: ``node`` has no effective value for ``field``."""
+    return node.id.in_(select(cte.c.id).where(cte.c[f"{field}_eff"].is_(None)))
 
 
+# Thin wrappers that build their own CTE and bind to ``Node`` (for callers/tests
+# that just want a standalone WHERE predicate).
 def effective_equals_clause(db: Session, dataset_id: int, field: str, value):
-    """SQL expression: true for nodes whose *effective* ``field`` equals ``value``."""
-    own_match = Node.id.in_(_own_ids(dataset_id, field, value=value))
-    region = _folder_region_clause(_folder_overrides(db, dataset_id, field), value)
-    if region is None:
-        return own_match
-    # Inherited only where the node has no own value of its own.
-    own_is_null = Node.id.notin_(_own_ids(dataset_id, field, notnull=True))
-    return or_(own_match, and_(own_is_null, region))
+    return eff_equals_pred(Node, effective_cte(dataset_id), field, value)
 
 
 def effective_isnull_clause(db: Session, dataset_id: int, field: str):
-    """SQL expression: true for nodes with no effective value for ``field``."""
-    own_is_null = Node.id.notin_(_own_ids(dataset_id, field, notnull=True))
-    folders = _folder_overrides(db, dataset_id, field)
-    if not folders:
-        return own_is_null
-    not_under_folder = not_(_like_any([mp + "%" for mp, _ in folders]))
-    return and_(own_is_null, not_under_folder)
+    return eff_isnull_pred(Node, effective_cte(dataset_id), field)
 
 
 def effective_true_clause(db: Session, dataset_id: int, field: str):
-    """Effective value is boolean True (used by the rollups / hide filters)."""
-    return effective_equals_clause(db, dataset_id, field, True)
+    return eff_true_pred(Node, effective_cte(dataset_id), field)
 
 
 def ancestor_ids_self_first(mat_path: str) -> list[int]:
@@ -252,6 +215,64 @@ def folder_stats(
     return {"file_count": int(row[0]), "total_size": int(row[1])}
 
 
+class ViewFilter:
+    """Rebindable view filter: renders the same predicate against any node alias.
+
+    The effective-value parts (flags / jira / assignee) are semi-joins against a
+    shared ``cte`` (one recursive walk per statement); the raw parts (type /
+    last-accessed) reference the given node alias directly. ``build(node)`` is
+    called with ``Node`` for the flat grid/search and with the descendant alias for
+    the folder rollups, so search, rollups, and the type breakdown all share one
+    filter definition (no drift).
+    """
+
+    def __init__(
+        self, cte, *, types=None, accessed_after=None, accessed_before=None,
+        no_transfer=None, processed=None, jira=None, assignee=None,
+    ):
+        self.cte = cte
+        self.types = types
+        self.accessed_after = accessed_after
+        self.accessed_before = accessed_before
+        self.no_transfer = no_transfer
+        self.processed = processed
+        self.jira = jira
+        self.assignee = assignee
+
+    @property
+    def active(self) -> bool:
+        return any((
+            self.types, self.accessed_after, self.accessed_before,
+            self.no_transfer, self.processed, self.jira, self.assignee,
+        ))
+
+    def build(self, node):
+        """Return the combined predicate bound to ``node`` (or None if inactive)."""
+        conds = []
+        if self.types:
+            conds.append(node.file_type.in_(list(self.types)))
+        if self.accessed_after:
+            conds.append(node.last_accessed >= self.accessed_after)
+        if self.accessed_before:
+            conds.append(node.last_accessed <= self.accessed_before)
+        for field, state in (("no_transfer", self.no_transfer),
+                             ("processed", self.processed)):
+            if state == "yes":
+                conds.append(eff_true_pred(node, self.cte, field))
+            elif state == "no":
+                # "not effectively marked" == effective false OR null; the semi-join
+                # subquery yields only non-null ids, so NOT IN stays NULL-safe.
+                conds.append(not_(eff_true_pred(node, self.cte, field)))
+        for field, value in (("jira_ticket", self.jira), ("assignee", self.assignee)):
+            if not value:
+                continue
+            if value == UNASSIGNED:
+                conds.append(eff_isnull_pred(node, self.cte, field))
+            else:
+                conds.append(eff_equals_pred(node, self.cte, field, value))
+        return and_(*conds) if conds else None
+
+
 def build_filters(
     db: Session,
     dataset_id: int,
@@ -264,51 +285,22 @@ def build_filters(
     jira: str | None = None,
     assignee: str | None = None,
 ) -> dict:
-    """Translate request filter params into reusable SQL clauses.
+    """Build the shared effective-value CTE and a rebindable ``ViewFilter``.
 
     ``no_transfer`` / ``processed`` are tri-state: None (any), "yes" (show only
     effectively-marked), or "no" (hide effectively-marked). ``jira`` / ``assignee``
     filter on the *effective* value: a specific string matches that value, the
     ``UNASSIGNED`` sentinel ("__none__") matches records with no effective value.
-    The returned ``view_filter`` combines every active filter; ``nt_clause`` /
-    ``proc_clause`` are the raw effective-true expressions (used for folder
-    rollups regardless of whether a filter is active).
+    Returns the ``cte`` (reused by the rollups for their marked counts), the
+    ``view_filter`` spec, and whether any filter is active.
     """
-    nt_clause = effective_true_clause(db, dataset_id, "no_transfer")
-    proc_clause = effective_true_clause(db, dataset_id, "processed")
-    conds = []
-    if types:
-        conds.append(Node.file_type.in_(list(types)))
-    if accessed_after:
-        conds.append(Node.last_accessed >= accessed_after)
-    if accessed_before:
-        conds.append(Node.last_accessed <= accessed_before)
-    if no_transfer == "yes":
-        conds.append(nt_clause)
-    elif no_transfer == "no":
-        conds.append(not_(nt_clause))
-    if processed == "yes":
-        conds.append(proc_clause)
-    elif processed == "no":
-        conds.append(not_(proc_clause))
-
-    def value_filter(field: str, value: str | None):
-        if not value:
-            return
-        if value == UNASSIGNED:
-            conds.append(effective_isnull_clause(db, dataset_id, field))
-        else:
-            conds.append(effective_equals_clause(db, dataset_id, field, value))
-
-    value_filter("jira_ticket", jira)
-    value_filter("assignee", assignee)
-
-    return {
-        "view_filter": and_(*conds) if conds else None,
-        "nt_clause": nt_clause,
-        "proc_clause": proc_clause,
-        "filter_active": bool(conds),
-    }
+    cte = effective_cte(dataset_id)
+    vf = ViewFilter(
+        cte, types=types, accessed_after=accessed_after,
+        accessed_before=accessed_before, no_transfer=no_transfer,
+        processed=processed, jira=jira, assignee=assignee,
+    )
+    return {"cte": cte, "view_filter": vf, "filter_active": vf.active}
 
 
 def distinct_values(db: Session, dataset_id: int, field: str) -> list[str]:
@@ -325,45 +317,60 @@ def distinct_values(db: Session, dataset_id: int, field: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-def folder_metrics(
+def folder_metrics_bulk(
     db: Session,
-    node: Node,
+    folders: list[Node],
     *,
-    view_filter=None,
-    nt_clause=None,
-    proc_clause=None,
-) -> dict:
-    """One-query rollup over a folder's descendant files.
+    cte,
+    view_filter: "ViewFilter | None" = None,
+) -> dict[int, dict]:
+    """Rollup over each folder's descendant files, for many folders in ONE query.
 
-    Returns the filtered file count/size (what the tree should display given the
-    active filters) plus the total file count and how many files are *effectively*
-    marked no_transfer / processed (for the folder's tri-state checkbox).
+    For every folder in ``folders`` returns the total descendant-file count, the
+    filtered file count/size (respecting ``view_filter``), and how many files are
+    *effectively* marked no_transfer / processed (for the tri-state checkbox). All
+    counts exclude sub-folders and the folder itself, and the marked counts use the
+    shared ``cte`` so a file under a marked folder counts even with no own value.
     """
-    base = [
-        Node.dataset_id == node.dataset_id,
-        Node.mat_path.like(f"{node.mat_path}%"),
-        Node.id != node.id,
-        Node.is_dir.is_(False),
-    ]
-    filtered_count = func.count().filter(view_filter) if view_filter is not None else func.count()
-    filtered_size = (
-        func.coalesce(func.sum(Node.size_bytes).filter(view_filter), 0)
-        if view_filter is not None
-        else func.coalesce(func.sum(Node.size_bytes), 0)
+    if not folders:
+        return {}
+    f = aliased(Node)
+    d = aliased(Node)
+    is_file = d.is_dir.is_(False)
+    join_cond = and_(
+        d.dataset_id == f.dataset_id,
+        d.mat_path.like(f.mat_path.concat("%")),
+        d.id != f.id,
     )
-    nt = func.count().filter(nt_clause) if nt_clause is not None else literal(0)
-    pc = func.count().filter(proc_clause) if proc_clause is not None else literal(0)
+    view_pred = view_filter.build(d) if view_filter is not None else None
+    filtered = and_(is_file, view_pred) if view_pred is not None else is_file
+    nt = and_(is_file, eff_true_pred(d, cte, "no_transfer"))
+    pc = and_(is_file, eff_true_pred(d, cte, "processed"))
 
-    row = db.execute(
-        select(func.count(), filtered_count, filtered_size, nt, pc).where(and_(*base))
-    ).one()
-    return {
-        "total_files": int(row[0]),
-        "filtered_file_count": int(row[1]),
-        "filtered_total_size": int(row[2]),
-        "no_transfer_marked": int(row[3]),
-        "processed_marked": int(row[4]),
-    }
+    stmt = (
+        select(
+            f.id.label("folder_id"),
+            func.count().filter(is_file).label("total_files"),
+            func.count().filter(filtered).label("filtered_file_count"),
+            func.coalesce(func.sum(d.size_bytes).filter(filtered), 0).label("filtered_total_size"),
+            func.count().filter(nt).label("no_transfer_marked"),
+            func.count().filter(pc).label("processed_marked"),
+        )
+        .select_from(f)
+        .join(d, join_cond, isouter=True)  # keep folders with zero descendant files
+        .where(f.id.in_([n.id for n in folders]))
+        .group_by(f.id)
+    )
+    out: dict[int, dict] = {}
+    for row in db.execute(stmt).all():
+        out[row.folder_id] = {
+            "total_files": int(row.total_files),
+            "filtered_file_count": int(row.filtered_file_count),
+            "filtered_total_size": int(row.filtered_total_size),
+            "no_transfer_marked": int(row.no_transfer_marked),
+            "processed_marked": int(row.processed_marked),
+        }
+    return out
 
 
 def folder_counts(db: Session, node: Node) -> dict:
@@ -386,12 +393,12 @@ def type_breakdown(
     db: Session,
     node: Node,
     *,
-    view_filter=None,
+    view_filter: "ViewFilter | None" = None,
     search: str | None = None,
 ) -> list[dict]:
     """File-type histogram (count + total size) for files under ``node``.
 
-    ``view_filter`` is the combined filter clause (type / last-accessed / flags /
+    ``view_filter`` is the combined filter spec (type / last-accessed / flags /
     assignee / jira) so the breakdown matches the folder's filtered file count.
     """
     conds = [
@@ -400,8 +407,9 @@ def type_breakdown(
         Node.id != node.id,
         Node.is_dir.is_(False),
     ]
-    if view_filter is not None:
-        conds.append(view_filter)
+    view_pred = view_filter.build(Node) if view_filter is not None else None
+    if view_pred is not None:
+        conds.append(view_pred)
     if search:
         conds.append(Node.file_type.ilike(f"%{search}%"))
     stmt: Select = (
@@ -575,7 +583,7 @@ def grid_filter_conds(
     """Build the WHERE conditions for the grid/search (shared by search + bulk).
 
     Returns ``(conds, filters)`` where ``filters`` is the build_filters() result
-    (so callers can reuse its rollup clauses).
+    (so callers can reuse its shared effective-value CTE for the rollups).
     """
     conds = [Node.dataset_id == dataset_id]
     if q:
@@ -599,8 +607,9 @@ def grid_filter_conds(
         db, dataset_id, no_transfer=no_transfer, processed=processed,
         jira=jira, assignee=assignee,
     )
-    if filters["view_filter"] is not None:
-        conds.append(filters["view_filter"])
+    view_pred = filters["view_filter"].build(Node)
+    if view_pred is not None:
+        conds.append(view_pred)
     return conds, filters
 
 
