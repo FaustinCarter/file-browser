@@ -288,7 +288,9 @@ def bulk_by_filter(
             q=payload.q,
             types=payload.types,
             owner=payload.owner,
-            is_dir=payload.is_dir,
+            # files_only forces the match to files so we don't create a per-folder
+            # override for every matched folder.
+            is_dir=False if payload.files_only else payload.is_dir,
             jira=payload.jira,
             assignee=payload.assignee,
             processed=payload.processed,

@@ -149,8 +149,15 @@ export default function GridView({ datasetId, toast }: Props) {
   async function bulkApply(values: Partial<Annotation>) {
     try {
       if (selectAllMatching) {
-        // One request applies to every matching row across all pages.
-        const r = await api.bulkByFilter({ ...filterParams(), values });
+        // One request applies to every matching row across all pages. Restrict
+        // to files (unless the user is explicitly filtering to folders) so a
+        // huge selection doesn't create a per-folder override for every folder;
+        // folders reflect the change through their rollup.
+        const r = await api.bulkByFilter({
+          ...filterParams(),
+          files_only: isDir !== "true",
+          values,
+        });
         toast(`Updated ${r.updated.toLocaleString()} rows`);
       } else {
         if (selected.size === 0) return;

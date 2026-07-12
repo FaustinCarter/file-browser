@@ -424,6 +424,70 @@ def test_effective_filter_bounded_with_many_file_overrides(client):
     assert only["total"] == 200
 
 
+def _upload_folders(client, nfolders, files_each=2):
+    header = (
+        "Name,Full Path,Size,Allocated,Files,Folders,% of Parent (Allocated),"
+        "Last Modified,Last Accessed,Owner,Type,Dir Level (Relative)"
+    )
+    lines = [header, f"Root,C:\\Root\\,1 GB,1 GB,{nfolders*files_each},{nfolders},100 %,01/01/2024,01/01/2024,a,File Folder,0"]
+    for i in range(nfolders):
+        lines.append(f"D{i},C:\\Root\\D{i}\\,1 MB,1 MB,{files_each},0,1 %,01/01/2024,01/01/2024,a,File Folder,1")
+        for j in range(files_each):
+            lines.append(
+                f"f{i}_{j}.txt,C:\\Root\\D{i}\\f{i}_{j}.txt,1 MB,1 MB,1,0,1 %,"
+                "01/01/2024,01/01/2024,a,Text File,2"
+            )
+    csv = "\n".join(lines) + "\n"
+    return client.post("/api/datasets", files={"file": ("f.csv", csv, "text/csv")}).json()
+
+
+def test_bulk_by_filter_files_only_marks_files_not_folders(client):
+    """The grid 'select all -> toggle' path marks files only, so it doesn't
+    create a per-folder override for every folder (which bloats the filters)."""
+    ds = _upload_many_files(client, 50)
+    dsid = ds["id"]
+    r = client.post(
+        "/api/nodes/bulk-by-filter",
+        json={"dataset_id": dsid, "files_only": True, "values": {"no_transfer": True}},
+    )
+    assert r.json()["updated"] == 50  # the 50 files, not the folder
+
+    root = client.get("/api/tree/children", params={"dataset_id": dsid}).json()["children"][0]
+    assert root["own"]["no_transfer"] is None  # no folder override created
+    assert root["no_transfer_marked"] == 50 and root["total_files"] == 50  # rollup marked
+
+
+def test_effective_clause_bounded_with_many_folder_overrides(client):
+    """Many folder overrides must collapse into a bounded clause (LIKE ANY), not
+    one LIKE per folder."""
+    ds = _upload_folders(client, 40, files_each=2)
+    dsid = ds["id"]
+    folders = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": dsid, "is_dir": True, "page_size": 200},
+    ).json()["items"]
+    folder_ids = [f["id"] for f in folders if f["name"].startswith("D")]
+    assert len(folder_ids) == 40
+    for fid in folder_ids:
+        client.post(f"/api/nodes/{fid}/folder-flag", json={"field": "no_transfer", "value": True})
+
+    from app.database import SessionLocal
+    from app.services import effective_true_clause
+
+    db = SessionLocal()
+    try:
+        sql = str(effective_true_clause(db, dsid, "no_transfer")).upper()
+        assert sql.count(" LIKE ") <= 2, sql  # collapsed, not 40 terms
+    finally:
+        db.close()
+
+    g = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": dsid, "is_dir": False, "no_transfer": "yes", "page_size": 1},
+    ).json()
+    assert g["total"] == 80  # 40 folders x 2 files all effectively marked
+
+
 def test_type_breakdown_respects_flag_filter(client, loaded):
     ds = loaded
     root = client.get("/api/tree/children", params={"dataset_id": ds["id"]}).json()["children"][0]

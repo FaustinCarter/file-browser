@@ -5,7 +5,9 @@ from datetime import date
 
 from sqlalchemy import (
     Select,
+    Text as SAText,
     and_,
+    any_,
     func,
     literal,
     not_,
@@ -13,9 +15,20 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Session
 
 from .models import Annotation, Node
+
+
+def _like_any(patterns: list[str]):
+    """``mat_path LIKE ANY(ARRAY[...])`` as a single bound-array parameter.
+
+    Collapses many prefix matches into one expression, so the generated SQL stays
+    tiny no matter how many folders are annotated (the array is a bind param, not
+    inlined text).
+    """
+    return Node.mat_path.like(any_(literal(patterns, ARRAY(SAText))))
 
 # Editable, inheritable annotation fields.
 ANNOTATION_FIELDS = (
@@ -86,21 +99,31 @@ def _folder_region_clause(folders: list, value):
     """OR of the subtree regions governed by a folder override with ``value``.
 
     Each matching folder contributes its subtree minus the subtrees of its
-    nearest descendant folder overrides (governed by a deeper value). Returns
-    None if no folder sets ``value``.
+    nearest descendant folder overrides (governed by a deeper value). Folders with
+    no nested override (the common case) are collapsed into one ``LIKE ANY`` array
+    so the clause stays small even with tens of thousands of annotated folders.
+    Returns None if no folder sets ``value``.
     """
     if not folders:
         return None
     direct = _direct_children([mp for mp, _ in folders])
-    clauses = []
+    simple: list[str] = []  # regions with no nested override -> collapsible
+    clauses = []            # regions needing a "minus nested override" cut
     for mp, v in folders:
         if v != value:
             continue
-        region = Node.mat_path.like(mp + "%")
         kids = direct.get(mp, [])
         if kids:
-            region = and_(region, not_(or_(*[Node.mat_path.like(k + "%") for k in kids])))
-        clauses.append(region)
+            clauses.append(
+                and_(
+                    Node.mat_path.like(mp + "%"),
+                    not_(_like_any([k + "%" for k in kids])),
+                )
+            )
+        else:
+            simple.append(mp + "%")
+    if simple:
+        clauses.append(_like_any(simple))
     return or_(*clauses) if clauses else None
 
 
@@ -121,7 +144,7 @@ def effective_isnull_clause(db: Session, dataset_id: int, field: str):
     folders = _folder_overrides(db, dataset_id, field)
     if not folders:
         return own_is_null
-    not_under_folder = not_(or_(*[Node.mat_path.like(mp + "%") for mp, _ in folders]))
+    not_under_folder = not_(_like_any([mp + "%" for mp, _ in folders]))
     return and_(own_is_null, not_under_folder)
 
 

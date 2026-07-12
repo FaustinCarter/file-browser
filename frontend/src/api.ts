@@ -241,6 +241,7 @@ export const api = {
   // Apply an edit to every row matching a grid filter (all pages at once).
   bulkByFilter: (payload: {
     dataset_id: number;
+    files_only?: boolean;
     q?: string;
     is_dir?: boolean;
     jira?: string;

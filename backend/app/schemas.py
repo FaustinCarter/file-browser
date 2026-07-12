@@ -126,6 +126,10 @@ class BulkAnnotationUpdate(BaseModel):
 class GridBulkUpdate(BaseModel):
     """Apply an annotation edit to every row matching the grid filter."""
     dataset_id: int
+    # Apply to files only (folders reflect the change via their rollup). This
+    # keeps big "select all" edits from creating a per-folder override for every
+    # folder, which would bloat the effective-value filters.
+    files_only: bool = False
     q: str | None = None
     types: list[str] | None = None
     owner: str | None = None
