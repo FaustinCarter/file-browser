@@ -6,10 +6,13 @@ from datetime import date
 from sqlalchemy import (
     Select,
     and_,
+    any_,
     func,
+    literal,
     select,
     update,
 )
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session, aliased
 
 from .models import Annotation, Node
@@ -169,9 +172,10 @@ def refresh_effective_columns(db: Session, dataset_id: int) -> None:
 #      updated eff columns -- O(that folder's subtree), not O(dataset).
 
 
-def _own_from_parent_select(dataset_id: int, node_ids: list[int]):
-    """Each of ``node_ids``' new effective value: its own (current) annotation,
-    else its parent's *current* ``<field>_eff`` (assumed already correct)."""
+def _own_from_parent_select(dataset_id: int, node_ids: list[int], fields: tuple[str, ...]):
+    """Each of ``node_ids``' new effective value for ``fields``: its own
+    (current) annotation, else its parent's *current* ``<field>_eff``
+    (assumed already correct)."""
     ann = aliased(Annotation)
     parent = aliased(Node)
     return (
@@ -179,35 +183,83 @@ def _own_from_parent_select(dataset_id: int, node_ids: list[int]):
             Node.id.label("id"),
             *[
                 func.coalesce(_own_expr(ann, f), getattr(parent, f"{f}_eff")).label(f"{f}_eff")
-                for f in MATERIALIZED_FIELDS
+                for f in fields
             ],
         )
         .select_from(Node)
         .join(ann, ann.node_id == Node.id, isouter=True)
         .join(parent, parent.id == Node.parent_id, isouter=True)
-        .where(Node.id.in_(node_ids), Node.dataset_id == dataset_id)
+        .where(Node.id == any_(node_ids), Node.dataset_id == dataset_id)
     )
 
 
-def _refresh_own_from_parent(db: Session, dataset_id: int, node_ids: list[int]) -> None:
-    if not node_ids:
+def _refresh_own_from_parent(
+    db: Session, dataset_id: int, node_ids: list[int], fields: tuple[str, ...],
+) -> None:
+    if not node_ids or not fields:
         return
-    sub = _own_from_parent_select(dataset_id, node_ids).subquery()
+    sub = _own_from_parent_select(dataset_id, node_ids, fields).subquery()
     stmt = (
         update(Node)
-        .values(**{f"{f}_eff": sub.c[f"{f}_eff"] for f in MATERIALIZED_FIELDS})
+        .values(**{f"{f}_eff": sub.c[f"{f}_eff"] for f in fields})
         .where(Node.id == sub.c.id)
     )
     db.execute(stmt)
 
 
-def _subtree_propagate_cte(dataset_id: int, root_ids: list[int]):
+def _is_clearing(field: str, value) -> bool:
+    """Whether writing ``value`` to ``field`` means "no own value" (falls
+    back to inheritance) -- ``None`` always does; for text fields, so does
+    ``""`` (matching ``_own_expr``'s ``NULLIF(col, '')``)."""
+    if value is None:
+        return True
+    return field in TEXT_FIELDS and value == ""
+
+
+def _refresh_own_direct(db: Session, dataset_id: int, node_ids: list[int], direct: dict) -> None:
+    """Every node in ``node_ids`` just had its own ``field`` set to the SAME
+    concrete (non-clearing) value, for every ``field`` in ``direct`` -- own
+    always beats inherited, so the new effective value is simply that
+    literal. A single UPDATE with no joins at all, vs. the 3-index-probe-
+    per-row COALESCE-with-parent computation ``_refresh_own_from_parent``
+    needs when a field *might* have been cleared back to inheriting.
+
+    This is the common case for a bulk edit (folder-flag, grid "apply to
+    every matching row") -- it writes the same value to every touched node,
+    so we already know the answer without reading anything back. Measured on
+    a 98.7k-row scattered bulk edit at 2.2M-row scale: this cut the refresh
+    step from ~8.5s to well under a second.
+    """
+    if not node_ids or not direct:
+        return
+    stmt = (
+        update(Node)
+        .values(**{f"{f}_eff": v for f, v in direct.items()})
+        .where(Node.id == any_(node_ids), Node.dataset_id == dataset_id)
+    )
+    db.execute(stmt)
+
+
+def _refresh_own(db: Session, dataset_id: int, node_ids: list[int], values: dict) -> None:
+    """Recompute ``node_ids``' own effective value for every materialized
+    field present in ``values``, split into the cheap direct-literal path
+    (field set to a concrete value) and the COALESCE-with-parent fallback
+    (field cleared to ``None``/``""``, which needs to know what the nearest
+    ancestor says now that this node no longer overrides it)."""
+    touched = {f: values[f] for f in MATERIALIZED_FIELDS if f in values}
+    direct = {f: v for f, v in touched.items() if not _is_clearing(f, v)}
+    clearing_fields = tuple(f for f in touched if f not in direct)
+    _refresh_own_direct(db, dataset_id, node_ids, direct)
+    _refresh_own_from_parent(db, dataset_id, node_ids, clearing_fields)
+
+
+def _subtree_propagate_cte(dataset_id: int, root_ids: list[int], fields: tuple[str, ...]):
     """Recursive CTE seeded at ``root_ids`` (whose eff columns must already be
-    current), walking down through their descendants only."""
+    current), walking down through their descendants only, for ``fields``."""
     anchor = select(
         Node.id.label("id"),
-        *[getattr(Node, f"{f}_eff").label(f"{f}_eff") for f in MATERIALIZED_FIELDS],
-    ).where(Node.id.in_(root_ids))
+        *[getattr(Node, f"{f}_eff").label(f"{f}_eff") for f in fields],
+    ).where(Node.id == any_(root_ids))
     eff = anchor.cte("eff_subtree", recursive=True)
     child = aliased(Node)
     ac = aliased(Annotation)
@@ -216,7 +268,7 @@ def _subtree_propagate_cte(dataset_id: int, root_ids: list[int]):
             child.id.label("id"),
             *[
                 func.coalesce(_own_expr(ac, f), eff.c[f"{f}_eff"]).label(f"{f}_eff")
-                for f in MATERIALIZED_FIELDS
+                for f in fields
             ],
         )
         .select_from(eff)
@@ -226,13 +278,15 @@ def _subtree_propagate_cte(dataset_id: int, root_ids: list[int]):
     return eff.union_all(rec)
 
 
-def _propagate_subtrees(db: Session, dataset_id: int, root_ids: list[int]) -> None:
+def _propagate_subtrees(
+    db: Session, dataset_id: int, root_ids: list[int], fields: tuple[str, ...],
+) -> None:
     if not root_ids:
         return
-    sub = _subtree_propagate_cte(dataset_id, root_ids)
+    sub = _subtree_propagate_cte(dataset_id, root_ids, fields)
     stmt = (
         update(Node)
-        .values(**{f"{f}_eff": sub.c[f"{f}_eff"] for f in MATERIALIZED_FIELDS})
+        .values(**{f"{f}_eff": sub.c[f"{f}_eff"] for f in fields})
         .where(Node.id == sub.c.id)
     )
     db.execute(stmt)
@@ -251,7 +305,7 @@ def _dedupe_nested_folders(db: Session, dataset_id: int, folder_ids: list[int]) 
         return []
     rows = db.execute(
         select(Node.id, Node.mat_path)
-        .where(Node.id.in_(folder_ids), Node.dataset_id == dataset_id)
+        .where(Node.id == any_(folder_ids), Node.dataset_id == dataset_id)
         .order_by(Node.mat_path)
     ).all()
     roots: list[int] = []
@@ -264,48 +318,90 @@ def _dedupe_nested_folders(db: Session, dataset_id: int, folder_ids: list[int]) 
     return roots
 
 
-def refresh_effective_for_node(db: Session, dataset_id: int, node_id: int, *, is_dir: bool) -> None:
+def materialized_fields_touched(values: dict) -> tuple[str, ...]:
+    """The subset of ``MATERIALIZED_FIELDS`` present in a values dict (e.g.
+    ``AnnotationUpdate.model_dump(exclude_unset=True)``).
+
+    Callers should pass this (not the full ``MATERIALIZED_FIELDS``) to the
+    refresh functions below: rewriting an eff column also rewrites its index
+    entry, so recomputing all 4 on every write when a given edit only ever
+    touches one or two of them roughly triples the write cost for nothing --
+    ``target_location``/``comment`` edits touch zero materialized fields and
+    can skip the refresh call entirely (see callers).
+    """
+    return tuple(f for f in MATERIALIZED_FIELDS if f in values)
+
+
+def refresh_effective_for_node(
+    db: Session, dataset_id: int, node_id: int, *, is_dir: bool, values: dict,
+) -> None:
     """A single node's own annotation was just written (upsert/clear).
 
     O(1) for a file (leaf, nothing to propagate to); O(that folder's subtree)
     for a folder, since descendants may now inherit a different value.
+    ``values`` is the write's actual payload (e.g.
+    ``AnnotationUpdate.model_dump(exclude_unset=True)``) -- skip the call
+    entirely if ``materialized_fields_touched(values)`` is empty.
     """
-    _refresh_own_from_parent(db, dataset_id, [node_id])
+    _refresh_own(db, dataset_id, [node_id], values)
     if is_dir:
-        _propagate_subtrees(db, dataset_id, [node_id])
+        _propagate_subtrees(db, dataset_id, [node_id], materialized_fields_touched(values))
 
 
-def refresh_effective_for_subtree(db: Session, dataset_id: int, folder_id: int) -> None:
+def refresh_effective_for_subtree(
+    db: Session, dataset_id: int, folder_id: int, *, fields: tuple[str, ...],
+    own_values: dict | None = None,
+) -> None:
     """A bulk write touched some subset of ``folder_id``'s subtree (bulk-stamp,
     scoped clear, folder-flag) -- possibly including ``folder_id`` itself.
 
     O(that folder's subtree), never O(dataset), regardless of how much of the
     subtree the write actually touched -- recomputing everything under one
     bounded folder is simpler and still cheap relative to the dataset.
+
+    ``fields``: materialized fields that changed somewhere in the subtree
+    (the folder's own, or any descendant's) -- always required, drives the
+    propagate-to-descendants walk (step 2), since a bulk write's own-value
+    writes land straight on ``annotations``, not on the materialized columns.
+
+    ``own_values``: pass this **only** if ``folder_id``'s own annotation was
+    itself part of this write (whole-subtree folder-flag, or a bulk-stamp
+    with ``include_self`` and no ``files_only``) -- lets step 1 use the cheap
+    direct-literal path for the folder's own eff. Omit/leave ``None`` when
+    only descendants were touched (scoped folder-flag, bulk-stamp with
+    ``files_only``): the folder's own value is untouched by construction, so
+    step 1 must be skipped entirely -- running it would incorrectly stomp the
+    folder's own (still-indeterminate) effective value with whatever the
+    *descendant* write happened to set.
     """
-    _refresh_own_from_parent(db, dataset_id, [folder_id])
-    _propagate_subtrees(db, dataset_id, [folder_id])
+    if own_values:
+        _refresh_own(db, dataset_id, [folder_id], own_values)
+    _propagate_subtrees(db, dataset_id, [folder_id], fields)
 
 
-def refresh_effective_for_nodes(db: Session, dataset_id: int, node_ids: list[int]) -> None:
+def refresh_effective_for_nodes(
+    db: Session, dataset_id: int, node_ids: list[int], *, values: dict,
+) -> None:
     """An arbitrary, possibly-scattered set of nodes were each just stamped
-    with their own value (grid "apply to every filtered row").
+    with the same own ``values`` (grid "apply to every filtered row").
 
     O(sum of touched folders' subtree sizes), not O(dataset): every touched
-    node's own value is recomputed directly, and any touched *folders* also
-    propagate to their descendants (deduped so nested touched folders aren't
-    walked twice).
+    node's own value is recomputed directly (the cheap literal-value path
+    when ``values`` sets a concrete value, since every one of ``node_ids``
+    got the identical write), and any touched *folders* also propagate to
+    their descendants (deduped so nested touched folders aren't walked
+    twice).
     """
     if not node_ids:
         return
-    _refresh_own_from_parent(db, dataset_id, node_ids)
+    _refresh_own(db, dataset_id, node_ids, values)
     dir_ids = [
         r[0] for r in db.execute(
-            select(Node.id).where(Node.id.in_(node_ids), Node.is_dir.is_(True))
+            select(Node.id).where(Node.id == any_(node_ids), Node.is_dir.is_(True))
         ).all()
     ]
     roots = _dedupe_nested_folders(db, dataset_id, dir_ids)
-    _propagate_subtrees(db, dataset_id, roots)
+    _propagate_subtrees(db, dataset_id, roots, materialized_fields_touched(values))
 
 
 def ancestor_ids_self_first(mat_path: str) -> list[int]:
@@ -760,33 +856,47 @@ def bulk_set_under(
 
 
 def _apply_annotation_values(
-    db: Session, dataset_id: int, node_ids: list[int], values: dict,
-    actor: str | None, *, chunk: int = 5000,
+    db: Session, dataset_id: int, node_ids: list[int], values: dict, actor: str | None,
 ) -> int:
-    """Upsert ``values`` (+ audit) onto each node in ``node_ids``, in chunks."""
+    """Upsert ``values`` (+ audit) onto each node in ``node_ids``.
+
+    An ``INSERT ... SELECT ... ON CONFLICT (node_id) DO UPDATE``, entirely
+    server-side: the source rows come from a ``SELECT id, <constants> FROM
+    nodes WHERE id = ANY(...)``, not from a list of Python dicts round-tripped
+    through the client. That matters a lot at scale -- a prior version built
+    ``node_ids`` into one Python dict per row and sent all of them as bind
+    parameters (SQLAlchemy's "insertmanyvalues"), which was ~6-7x slower than
+    this in practice (measured on a ~99k-row bulk edit at 2.2M-row scale)
+    despite compiling to the "same" statement shape, because it round-trips
+    O(rows x columns) parameter values through the driver instead of letting
+    Postgres read `id` off the table it's already scanning. An even earlier
+    version used a per-row ORM load-or-create + setattr + flush loop, ~1,900
+    rows/s -- the original bottleneck this whole function replaces.
+
+    Same end state regardless of approach: an existing row only gets
+    ``clean``'s keys + audit touched via the DO UPDATE SET list; a new row
+    gets the rest at their column default (NULL).
+    """
     clean = {k: v for k, v in values.items() if k in ANNOTATION_FIELDS}
     if not node_ids or not clean:
         return 0
-    total = 0
-    for i in range(0, len(node_ids), chunk):
-        part = node_ids[i:i + chunk]
-        existing = {
-            a.node_id: a
-            for a in db.execute(
-                select(Annotation).where(Annotation.node_id.in_(part))
-            ).scalars()
-        }
-        for nid in part:
-            ann = existing.get(nid)
-            if ann is None:
-                ann = Annotation(node_id=nid, dataset_id=dataset_id)
-                db.add(ann)
-            for k, v in clean.items():
-                setattr(ann, k, v)
-            _stamp(ann, actor)
-        db.flush()
-        total += len(part)
-    return total
+    src = select(
+        Node.id.label("node_id"),
+        literal(dataset_id).label("dataset_id"),
+        *[literal(v).label(k) for k, v in clean.items()],
+        literal(actor).label("updated_by"),
+        func.now().label("updated_at"),
+    ).where(Node.id == any_(node_ids))
+    cols = ["node_id", "dataset_id", *clean.keys(), "updated_by", "updated_at"]
+    stmt = pg_insert(Annotation).from_select(cols, src)
+    excluded = stmt.excluded
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["node_id"],
+        set_={**{k: excluded[k] for k in clean}, "updated_by": excluded["updated_by"],
+              "updated_at": excluded["updated_at"]},
+    )
+    result = db.execute(stmt)
+    return result.rowcount
 
 
 def grid_filter_conds(

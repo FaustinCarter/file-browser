@@ -199,7 +199,8 @@ def update_annotation(
     # Only apply fields the client actually sent (so we can clear vs ignore).
     values = payload.model_dump(exclude_unset=True)
     services.upsert_annotation(db, node, values, actor=actor)
-    services.refresh_effective_for_node(db, node.dataset_id, node.id, is_dir=node.is_dir)
+    if services.materialized_fields_touched(values):
+        services.refresh_effective_for_node(db, node.dataset_id, node.id, is_dir=node.is_dir, values=values)
     db.commit()
     db.refresh(node)
     return _single_node_out(db, node)
@@ -244,12 +245,20 @@ def folder_flag(
                 accessed_after=payload.accessed_after,
                 accessed_before=payload.accessed_before, actor=actor,
             )
+        # Descendant files' own annotations changed, but the folder's own
+        # value is untouched by construction -- no own_values, or this would
+        # wrongly stomp the folder's (still-indeterminate) effective value.
+        services.refresh_effective_for_subtree(db, node.dataset_id, node.id, fields=(field,))
     else:
         # Whole subtree: wipe descendant overrides so the folder's value governs.
         services.clear_field_under(db, node, field, include_self=True, actor=actor)
         if payload.value is not None:
             services.upsert_annotation(db, node, {field: payload.value}, actor=actor)
-    services.refresh_effective_for_subtree(db, node.dataset_id, node.id)
+        # `field` is always one of BOOLEAN_FLAG_FIELDS, both materialized. The
+        # folder's own value was just written (or cleared) above.
+        services.refresh_effective_for_subtree(
+            db, node.dataset_id, node.id, fields=(field,), own_values={field: payload.value},
+        )
     db.commit()
     db.refresh(node)
     return _single_node_out(db, node)
@@ -276,7 +285,18 @@ def bulk_annotation(
         accessed_before=payload.accessed_before,
         actor=actor,
     )
-    services.refresh_effective_for_subtree(db, node.dataset_id, node.id)
+    fields = services.materialized_fields_touched(values)
+    if fields:
+        # bulk_set_under's own-node match is `mat_path LIKE folder.mat_path%`,
+        # which folder always satisfies trivially -- so the folder itself is
+        # among the stamped nodes (and its own annotation IS part of this
+        # write) exactly when include_self is set and files_only isn't
+        # forcing folders out of the match.
+        own_touched = payload.include_self and not payload.files_only
+        services.refresh_effective_for_subtree(
+            db, node.dataset_id, node.id, fields=fields,
+            own_values=values if own_touched else None,
+        )
     db.commit()
     return {"updated": count}
 
@@ -315,6 +335,10 @@ def bulk_by_filter(
         raise HTTPException(status_code=404, detail=str(e))
     # The grid filter can match a scattered set spanning the whole dataset (no
     # single bounding folder), so scope the refresh to exactly what matched.
-    services.refresh_effective_for_nodes(db, payload.dataset_id, touched_ids)
+    # Every one of touched_ids got `values` written to its own annotation
+    # (that's what bulk_set_matching just did), so the fast literal-value
+    # path applies uniformly here -- no own/descendant distinction needed.
+    if services.materialized_fields_touched(values):
+        services.refresh_effective_for_nodes(db, payload.dataset_id, touched_ids, values=values)
     db.commit()
     return {"updated": count}
