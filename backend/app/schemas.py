@@ -101,25 +101,38 @@ class FolderFlagUpdate(BaseModel):
     """Set/clear a rollup boolean on a folder.
 
     With no filter the whole subtree is affected (descendant overrides are
-    cleared and the folder's own value is set). With a type/last-accessed filter
-    the action is scoped to the matching files only, leaving the folder's own
-    value untouched (so it stays unchecked/indeterminate until all files match).
+    cleared and the folder's own value is set). With ANY filter active — type,
+    last-accessed, flag tri-state, JIRA, or assignee — the action is scoped to
+    the matching files only, leaving the folder's own value untouched (so it
+    stays unchecked/indeterminate until all files match). The flag/jira/
+    assignee filters match the node's *effective* value, with the same
+    "yes"/"no" and '__none__' contracts as the search endpoint, and are
+    evaluated against the pre-write state.
     """
     field: str  # "no_transfer" or "processed"
     value: bool | None  # True = mark, None = clear/unmark
     types: list[str] | None = None
     accessed_after: date | None = None
     accessed_before: date | None = None
+    no_transfer: str | None = None  # "yes" / "no"
+    processed: str | None = None  # "yes" / "no"
+    jira: str | None = None  # value, or "__none__" for no effective ticket
+    assignee: str | None = None  # value, or "__none__" for unassigned
 
 
 class BulkAnnotationUpdate(BaseModel):
     node_id: int  # folder (or any node) to scope under
     include_self: bool = True
     files_only: bool = False
-    # optional filters to narrow which descendants are stamped
+    # optional filters to narrow which descendants are stamped; flag/jira/
+    # assignee match the effective value (search-endpoint contracts)
     types: list[str] | None = None
     accessed_after: date | None = None
     accessed_before: date | None = None
+    no_transfer: str | None = None
+    processed: str | None = None
+    jira: str | None = None
+    assignee: str | None = None
     values: AnnotationUpdate
 
 

@@ -7,7 +7,25 @@ import {
   fmtBytes,
   folderFlagState,
   NodeOut,
+  UNASSIGNED,
 } from "../api";
+
+// Human-readable summary of the active filters, shown before a scoped apply so
+// the blast radius is explicit.
+export function describeFilters(f: Filters): string {
+  const parts: string[] = [];
+  if (f.types?.length) parts.push(`${f.types.length} file type(s)`);
+  if (f.accessed_after) parts.push(`accessed ≥ ${f.accessed_after}`);
+  if (f.accessed_before) parts.push(`accessed ≤ ${f.accessed_before}`);
+  if (f.no_transfer)
+    parts.push(`No Transfer: ${f.no_transfer === "yes" ? "marked" : "unmarked"}`);
+  if (f.processed)
+    parts.push(`Processed: ${f.processed === "yes" ? "processed" : "unprocessed"}`);
+  if (f.jira) parts.push(`JIRA: ${f.jira === UNASSIGNED ? "no ticket" : f.jira}`);
+  if (f.assignee)
+    parts.push(`Assignee: ${f.assignee === UNASSIGNED ? "unassigned" : f.assignee}`);
+  return parts.join(", ");
+}
 
 const FLAGS: { field: FlagField; label: string }[] = [
   { field: "no_transfer", label: "No Transfer?" },
@@ -38,10 +56,18 @@ export default function DetailPanel({
   const [counts, setCounts] = useState<{ file_count: number; folder_count: number } | null>(null);
   const [matchCount, setMatchCount] = useState<number | null>(null);
 
+  // ANY active filter scopes folder edits to the matching files. This must
+  // include the effective-value filters (flags / JIRA / assignee): treating
+  // them as "no filter" made a folder flag silently run the UNscoped
+  // whole-subtree path while the tree displayed a filtered subset.
   const filterActive = !!(
     (filters.types && filters.types.length) ||
     filters.accessed_after ||
-    filters.accessed_before
+    filters.accessed_before ||
+    filters.no_transfer ||
+    filters.processed ||
+    filters.jira ||
+    filters.assignee
   );
 
   const reload = () => {
@@ -85,7 +111,7 @@ export default function DetailPanel({
   }
 
   // Folder edit while a filter is active: stamp only the matching files in the
-  // subtree (recursively), leaving other types and the folder itself untouched.
+  // subtree (recursively), leaving non-matching files and the folder untouched.
   async function applyScoped(values: Partial<Annotation>) {
     try {
       const r = await api.bulkAnnotation({
@@ -95,6 +121,10 @@ export default function DetailPanel({
         types: filters.types,
         accessed_after: filters.accessed_after,
         accessed_before: filters.accessed_before,
+        no_transfer: filters.no_transfer,
+        processed: filters.processed,
+        jira: filters.jira,
+        assignee: filters.assignee,
         values,
       });
       toast(`Updated ${r.updated.toLocaleString()} matching file(s)`);
@@ -116,6 +146,10 @@ export default function DetailPanel({
         types: filterActive ? filters.types : undefined,
         accessed_after: filterActive ? filters.accessed_after : undefined,
         accessed_before: filterActive ? filters.accessed_before : undefined,
+        no_transfer: filterActive ? filters.no_transfer : undefined,
+        processed: filterActive ? filters.processed : undefined,
+        jira: filterActive ? filters.jira : undefined,
+        assignee: filterActive ? filters.assignee : undefined,
       });
       setNode(updated);
       onMutated();
@@ -210,7 +244,11 @@ export default function DetailPanel({
         </div>
 
         {node.is_dir && filterActive ? (
-          <ScopedFolderEdit matchCount={matchCount} onApply={applyScoped} />
+          <ScopedFolderEdit
+            matchCount={matchCount}
+            filters={filters}
+            onApply={applyScoped}
+          />
         ) : (
           <>
             {EDIT_FIELDS.map((f) => (
@@ -379,19 +417,23 @@ function FileFlag({
 
 function ScopedFolderEdit({
   matchCount,
+  filters,
   onApply,
 }: {
   matchCount: number | null;
+  filters: Filters;
   onApply: (v: Partial<Annotation>) => void;
 }) {
   const n = matchCount ?? 0;
   return (
     <div>
       <div className="muted" style={{ marginBottom: 10, fontSize: 11 }}>
-        A filter is active, so the fields below apply <b>recursively to the{" "}
-        {n.toLocaleString()} matching file(s)</b> in this subtree only. Other file
-        types (and the folder itself) are left unchanged.
+        Filter active (<b>{describeFilters(filters)}</b>), so the fields below
+        apply <b>recursively to the {n.toLocaleString()} matching file(s)</b> in
+        this subtree only. Non-matching files (and the folder itself) are left
+        unchanged.
       </div>
+      <ScopedText label="Assignee" n={n} onApply={(v) => onApply({ assignee: v || null })} />
       <ScopedText label="Target location" n={n} onApply={(v) => onApply({ target_location: v || null })} />
       <ScopedText label="JIRA ticket" n={n} onApply={(v) => onApply({ jira_ticket: v || null })} />
       <ScopedText label="Comment" n={n} onApply={(v) => onApply({ comment: v || null })} />
@@ -461,6 +503,10 @@ function BulkStamp({
         types: useFilters ? filters.types : undefined,
         accessed_after: useFilters ? filters.accessed_after : undefined,
         accessed_before: useFilters ? filters.accessed_before : undefined,
+        no_transfer: useFilters ? filters.no_transfer : undefined,
+        processed: useFilters ? filters.processed : undefined,
+        jira: useFilters ? filters.jira : undefined,
+        assignee: useFilters ? filters.assignee : undefined,
         values,
       });
       onDone(r.updated);

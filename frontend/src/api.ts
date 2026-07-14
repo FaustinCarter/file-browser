@@ -156,9 +156,14 @@ export const api = {
     payload: {
       field: FlagField;
       value: boolean | null;
+      // Any filter present scopes the write to matching descendant files only.
       types?: string[];
       accessed_after?: string;
       accessed_before?: string;
+      no_transfer?: string;
+      processed?: string;
+      jira?: string;
+      assignee?: string;
     },
   ) =>
     fetch(`/api/nodes/${nodeId}/folder-flag`, {
@@ -180,6 +185,10 @@ export const api = {
         types: filters.types,
         accessed_after: filters.accessed_after,
         accessed_before: filters.accessed_before,
+        no_transfer: filters.no_transfer,
+        processed: filters.processed,
+        jira: filters.jira,
+        assignee: filters.assignee,
       })}`,
     ).then((r) => j<{ file_count: number; total_size: number }>(r)),
 
@@ -227,9 +236,14 @@ export const api = {
     node_id: number;
     include_self?: boolean;
     files_only?: boolean;
+    // Scoping filters; flag/jira/assignee match the effective value.
     types?: string[];
     accessed_after?: string;
     accessed_before?: string;
+    no_transfer?: string;
+    processed?: string;
+    jira?: string;
+    assignee?: string;
     values: Partial<Annotation>;
   }) =>
     fetch("/api/nodes/bulk-annotation", {
@@ -243,11 +257,14 @@ export const api = {
     dataset_id: number;
     files_only?: boolean;
     q?: string;
+    types?: string[];
     is_dir?: boolean;
     jira?: string;
     assignee?: string;
     processed?: string;
     no_transfer?: string;
+    accessed_after?: string;
+    accessed_before?: string;
     values: Partial<Annotation>;
   }) =>
     fetch("/api/nodes/bulk-by-filter", {

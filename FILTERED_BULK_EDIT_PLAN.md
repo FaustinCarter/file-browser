@@ -1,5 +1,10 @@
 # Plan: Filter-scoped bulk edits for every flag and annotation
 
+> **Status: implemented.** All gaps G1–G7 are closed; functional tests cover
+> §4.1 and the perf suite gained the §4.2 write scenarios (see
+> `backend/tests/test_performance.py::test_write_scenarios_under_budget`).
+> This document remains as the design record.
+
 ## 1. Goal
 
 Any filter the frontend can express — file type(s), last-accessed range,

@@ -272,15 +272,27 @@ into sortable numeric values while the original strings are kept for display.
 - *All file types in a folder with counts, sortable & filterable* — the detail
   panel's "File types here" table / `GET /api/nodes/{id}/type-breakdown`.
 - *Mark files/folders No-Transfer/Processed (recursive)* — checkboxes in the
-  detail or grid view; folders cascade to all their files. **With a tree filter
-  active** (file type and/or last-accessed), checking a folder applies only to
-  the *matching* files in its subtree — other types are left untouched and the
-  folder stays indeterminate until every file is marked.
+  detail or grid view; folders cascade to all their files. **With ANY tree
+  filter active** (file type, last-accessed, flag tri-state, JIRA, assignee),
+  checking a folder applies only to the *matching* files in its subtree —
+  non-matching files are left untouched and the folder stays indeterminate
+  until every file is marked. The flag/JIRA/assignee filters match the
+  **effective** (own-or-inherited) value, evaluated before the write, so e.g.
+  "filter Not marked → check No Transfer" stamps exactly the files that
+  weren't already covered.
 - *Hide what you've handled* — filter the tree or grid by No-Transfer/Processed
   to drop marked rows (and fully-marked folders) from view.
 - *Assignee, target location, JIRA ticket, comment* — editable columns; bulk-edit
   by selection (grid) or by filtered subtree (detail panel's "Bulk stamp"). Assign
   a folder (inherited by its files) or a filtered set of files to a person.
+- *Stamp a JIRA ticket onto every file of some types in a subtree* — filter by
+  file type(s) in the tree, select the folder, and use the scoped editor
+  ("Apply to N matching"). Works with any filter combination: e.g. filter by
+  JIRA ticket + file type to add to (or clear from) that ticket's set, or
+  filter "Unassigned" to assign only the files nobody owns yet.
+- *The same, table-style* — the grid has the same multi-type / date / flag /
+  JIRA / assignee filters; "select all N matching" then applies any bulk value
+  (flags, assignee, JIRA, target, comment) to every match across all pages.
 - *Filter by JIRA ticket or Assignee (incl. unassigned)* — dropdowns in the tree
   filter bar and the grid match the **effective** value (own or inherited), with
   an "Unassigned" / "No ticket" option.

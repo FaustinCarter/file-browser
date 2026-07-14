@@ -8,6 +8,7 @@ import {
   NodeOut,
   UNASSIGNED,
 } from "../api";
+import TypeFilterSelect from "./TypeFilterSelect";
 
 interface Props {
   datasetId: number;
@@ -28,14 +29,21 @@ export default function GridView({ datasetId, toast }: Props) {
 
   // filters
   const [q, setQ] = useState("");
+  const [types, setTypes] = useState<string[] | undefined>(undefined);
   const [isDir, setIsDir] = useState<string>("");
   const [noTransfer, setNoTransfer] = useState<string>("");
   const [processed, setProcessed] = useState<string>("");
   const [jira, setJira] = useState("");
   const [assignee, setAssignee] = useState("");
+  const [accessedAfter, setAccessedAfter] = useState("");
+  const [accessedBefore, setAccessedBefore] = useState("");
+  const [availTypes, setAvailTypes] = useState<{ file_type: string; count: number }[]>([]);
   const [jiraVals, setJiraVals] = useState<string[]>([]);
   const [assigneeVals, setAssigneeVals] = useState<string[]>([]);
 
+  useEffect(() => {
+    api.fileTypes(datasetId).then(setAvailTypes).catch(() => setAvailTypes([]));
+  }, [datasetId]);
   useEffect(() => {
     api.distinctValues(datasetId, "jira_ticket").then((r) => setJiraVals(r.values)).catch(() => {});
     api.distinctValues(datasetId, "assignee").then((r) => setAssigneeVals(r.values)).catch(() => {});
@@ -45,13 +53,7 @@ export default function GridView({ datasetId, toast }: Props) {
     setLoading(true);
     api
       .search({
-        dataset_id: datasetId,
-        q: q || undefined,
-        is_dir: isDir === "" ? undefined : isDir === "true",
-        no_transfer: noTransfer || undefined,
-        processed: processed || undefined,
-        jira: jira || undefined,
-        assignee: assignee || undefined,
+        ...filterParams(),
         sort,
         direction: dir,
         page,
@@ -79,15 +81,20 @@ export default function GridView({ datasetId, toast }: Props) {
     else load();
   };
 
-  // Params describing the current result set (for "select all matching").
+  // Params describing the current result set. One definition feeds both the
+  // page fetch and "select all matching" -> bulk-by-filter, so what you see is
+  // exactly what a bulk edit touches.
   const filterParams = () => ({
     dataset_id: datasetId,
     q: q || undefined,
+    types,
     is_dir: isDir === "" ? undefined : isDir === "true",
     no_transfer: noTransfer || undefined,
     processed: processed || undefined,
     jira: jira || undefined,
     assignee: assignee || undefined,
+    accessed_after: accessedAfter || undefined,
+    accessed_before: accessedBefore || undefined,
   });
 
   const setSortCol = (c: string) => {
@@ -185,6 +192,7 @@ export default function GridView({ datasetId, toast }: Props) {
             placeholder="e.g. Reports"
           />
         </div>
+        <TypeFilterSelect types={availTypes} selected={types} onChange={setTypes} />
         <div className="filter-group">
           <label>Kind</label>
           <select value={isDir} onChange={(e) => setIsDir(e.target.value)}>
@@ -192,6 +200,22 @@ export default function GridView({ datasetId, toast }: Props) {
             <option value="false">Files</option>
             <option value="true">Folders</option>
           </select>
+        </div>
+        <div className="filter-group">
+          <label>Accessed after</label>
+          <input
+            type="date"
+            value={accessedAfter}
+            onChange={(e) => setAccessedAfter(e.target.value)}
+          />
+        </div>
+        <div className="filter-group">
+          <label>Accessed before</label>
+          <input
+            type="date"
+            value={accessedBefore}
+            onChange={(e) => setAccessedBefore(e.target.value)}
+          />
         </div>
         <div className="filter-group">
           <label>No Transfer</label>
@@ -490,6 +514,7 @@ function BulkBar({
   const [jira, setJira] = useState("");
   const [assignee, setAssignee] = useState("");
   const [target, setTarget] = useState("");
+  const [comment, setComment] = useState("");
   return (
     <div className="bulkbar">
       <span className="chip">{count} selected</span>
@@ -523,6 +548,15 @@ function BulkBar({
       />
       <button disabled={!target} onClick={() => onApply({ target_location: target })}>
         Set target
+      </button>
+      <input
+        placeholder="Comment"
+        value={comment}
+        onChange={(e) => setComment(e.target.value)}
+        style={{ width: 160 }}
+      />
+      <button disabled={!comment} onClick={() => onApply({ comment })}>
+        Set comment
       </button>
       <div className="spacer" />
       <button onClick={onClear}>Clear selection</button>

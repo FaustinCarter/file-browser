@@ -111,10 +111,11 @@ def folder_type_counts(req: FolderTypeCountRequest, db: Session = Depends(get_db
         if not node:
             result.append({"node_id": nid, "error": "not found"})
             continue
-        stats = services.folder_stats(
-            db, node, types=req.types,
+        f = services.build_filters(
+            db, node.dataset_id, types=req.types,
             accessed_after=req.accessed_after, accessed_before=req.accessed_before,
         )
+        stats = services.folder_stats(db, node, view_filter=f["view_filter"])
         result.append({
             "node_id": nid,
             "name": node.name,
@@ -151,15 +152,23 @@ def stats(
     types: list[str] | None = Query(None),
     accessed_after: date | None = Query(None),
     accessed_before: date | None = Query(None),
+    no_transfer: str | None = Query(None, description="'yes' / 'no' (effective)"),
+    processed: str | None = Query(None, description="'yes' / 'no' (effective)"),
+    jira: str | None = Query(None, description="effective value, or '__none__'"),
+    assignee: str | None = Query(None, description="effective value, or '__none__'"),
     db: Session = Depends(get_db),
 ):
+    """Filtered descendant-file count/size. Accepts the full filter set so the
+    UI's "Apply to N" preview counts exactly what a scoped write would touch."""
     node = db.get(Node, node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-    return services.folder_stats(
-        db, node, types=types, accessed_after=accessed_after,
-        accessed_before=accessed_before,
+    f = services.build_filters(
+        db, node.dataset_id, types=types, accessed_after=accessed_after,
+        accessed_before=accessed_before, no_transfer=no_transfer,
+        processed=processed, jira=jira, assignee=assignee,
     )
+    return services.folder_stats(db, node, view_filter=f["view_filter"])
 
 
 @router.get("/{node_id}/type-breakdown", response_model=list[TypeBreakdownRow])
@@ -217,8 +226,9 @@ def folder_flag(
 
     No filter -> the whole subtree: clear any descendant overrides, then set the
     folder's own value (so every file is effectively marked/unmarked).
-    With a type/last-accessed filter -> only the matching files are touched and
-    the folder's own value is left alone (it becomes indeterminate).
+    With ANY filter active (type / last-accessed / flag / JIRA / assignee) ->
+    only the matching files are touched and the folder's own value is left
+    alone (it becomes indeterminate).
     """
     node = db.get(Node, node_id)
     if not node:
@@ -228,22 +238,29 @@ def folder_flag(
     if payload.field not in services.BOOLEAN_FLAG_FIELDS:
         raise HTTPException(status_code=400, detail="Unsupported field")
 
-    scoped = bool(payload.types or payload.accessed_after or payload.accessed_before)
+    scoped = bool(
+        payload.types or payload.accessed_after or payload.accessed_before
+        or payload.no_transfer or payload.processed or payload.jira or payload.assignee
+    )
     field = payload.field
     if scoped:
         # Only the matching files; leave the folder's own value untouched.
+        f = services.build_filters(
+            db, node.dataset_id, types=payload.types,
+            accessed_after=payload.accessed_after,
+            accessed_before=payload.accessed_before,
+            no_transfer=payload.no_transfer, processed=payload.processed,
+            jira=payload.jira, assignee=payload.assignee,
+        )
         if payload.value is None:
             services.clear_field_under(
                 db, node, field, include_self=False, files_only=True,
-                types=payload.types, accessed_after=payload.accessed_after,
-                accessed_before=payload.accessed_before, actor=actor,
+                view_filter=f["view_filter"], actor=actor,
             )
         else:
             services.bulk_set_under(
                 db, node, {field: payload.value}, include_self=False,
-                files_only=True, types=payload.types,
-                accessed_after=payload.accessed_after,
-                accessed_before=payload.accessed_before, actor=actor,
+                files_only=True, view_filter=f["view_filter"], actor=actor,
             )
         # Descendant files' own annotations changed, but the folder's own
         # value is untouched by construction -- no own_values, or this would
@@ -276,26 +293,30 @@ def bulk_annotation(
     values = payload.values.model_dump(exclude_unset=True)
     if not values:
         raise HTTPException(status_code=400, detail="No values provided")
-    count = services.bulk_set_under(
+    f = services.build_filters(
+        db, node.dataset_id, types=payload.types,
+        accessed_after=payload.accessed_after,
+        accessed_before=payload.accessed_before,
+        no_transfer=payload.no_transfer, processed=payload.processed,
+        jira=payload.jira, assignee=payload.assignee,
+    )
+    count, own_stamped = services.bulk_set_under(
         db, node, values,
         include_self=payload.include_self,
         files_only=payload.files_only,
-        types=payload.types,
-        accessed_after=payload.accessed_after,
-        accessed_before=payload.accessed_before,
+        view_filter=f["view_filter"],
         actor=actor,
     )
     fields = services.materialized_fields_touched(values)
     if fields:
-        # bulk_set_under's own-node match is `mat_path LIKE folder.mat_path%`,
-        # which folder always satisfies trivially -- so the folder itself is
-        # among the stamped nodes (and its own annotation IS part of this
-        # write) exactly when include_self is set and files_only isn't
-        # forcing folders out of the match.
-        own_touched = payload.include_self and not payload.files_only
+        # own_values only when the folder's own annotation was actually part
+        # of this write (bulk_set_under reports it): include_self can still be
+        # overridden by files_only or by the folder not matching the filter,
+        # and refreshing its own eff columns with a value it never received
+        # would corrupt them.
         services.refresh_effective_for_subtree(
             db, node.dataset_id, node.id, fields=fields,
-            own_values=values if own_touched else None,
+            own_values=values if own_stamped else None,
         )
     db.commit()
     return {"updated": count}

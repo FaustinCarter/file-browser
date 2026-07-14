@@ -302,10 +302,13 @@ must preserve every one. Each has a test in §8.
   consistent with the grid/rollup — one shared filter definition.
 
 **Scoped folder edits (write behavior — must not regress)**
-- **I13** Folder flag **with** a type/last-accessed filter touches only matching
-  descendant **files** (`files_only`) and leaves the folder's own value untouched
-  (folder shows indeterminate). **Without** a filter it clears all descendant
-  overrides for the field, then sets the folder's own value.
+- **I13** Folder flag **with** any filter — type/last-accessed, and (since the
+  filter-scoped bulk-edit work, see `FILTERED_BULK_EDIT_PLAN.md`) the
+  effective-value filters (flag tri-state / JIRA / assignee) — touches only
+  matching descendant **files** (`files_only`) and leaves the folder's own
+  value untouched (folder shows indeterminate). **Without** a filter it clears
+  all descendant overrides for the field, then sets the folder's own value.
+  Effective-value filters are evaluated against the pre-write state.
 - **I17** `clear_field_under` only nulls fields on **existing** annotation rows
   (never creates a row to store NULL).
 

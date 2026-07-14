@@ -494,40 +494,27 @@ def _descendant_of_pred(ancestor_mat_path, descendant_mat_path):
     )
 
 
-def _descendant_files_filter(node: Node, *, types, accessed_after, accessed_before):
-    """Build the WHERE clause for files strictly under ``node`` matching filters."""
+def folder_stats(
+    db: Session,
+    node: Node,
+    *,
+    view_filter: "ViewFilter | None" = None,
+) -> dict:
+    """Recursive file count + total size for files under ``node`` (filtered).
+
+    ``view_filter`` carries the full filter set (types / dates / flags / jira /
+    assignee), so this count agrees exactly with what a scoped bulk write over
+    the same filters would touch -- it backs the UI's "Apply to N" preview.
+    """
     conds = [
         Node.dataset_id == node.dataset_id,
         Node.mat_path.like(f"{node.mat_path}%"),
         Node.id != node.id,
         Node.is_dir.is_(False),
     ]
-    _apply_file_filters(conds, types=types, accessed_after=accessed_after,
-                        accessed_before=accessed_before)
-    return conds
-
-
-def _apply_file_filters(conds: list, *, types, accessed_after, accessed_before):
-    if types:
-        conds.append(Node.file_type.in_(list(types)))
-    if accessed_after:
-        conds.append(Node.last_accessed >= accessed_after)
-    if accessed_before:
-        conds.append(Node.last_accessed <= accessed_before)
-
-
-def folder_stats(
-    db: Session,
-    node: Node,
-    *,
-    types: list[str] | None = None,
-    accessed_after: date | None = None,
-    accessed_before: date | None = None,
-) -> dict:
-    """Recursive file count + total size for files under ``node`` (filtered)."""
-    conds = _descendant_files_filter(
-        node, types=types, accessed_after=accessed_after, accessed_before=accessed_before
-    )
+    view_pred = view_filter.build(Node) if view_filter is not None else None
+    if view_pred is not None:
+        conds.append(view_pred)
     row = db.execute(
         select(func.count(Node.id), func.coalesce(func.sum(Node.size_bytes), 0)).where(
             and_(*conds)
@@ -779,22 +766,17 @@ def upsert_annotation(
     return ann
 
 
-def clear_field_under(
-    db: Session,
-    folder: Node,
-    field: str,
-    *,
-    include_self: bool = True,
-    files_only: bool = False,
-    types: list[str] | None = None,
-    accessed_after: date | None = None,
-    accessed_before: date | None = None,
-    actor: str | None = None,
-) -> int:
-    """Null out ``field`` on existing annotations within ``folder``'s subtree.
+def _subtree_write_conds(
+    folder: Node, *, include_self: bool, files_only: bool,
+    view_filter: "ViewFilter | None",
+) -> list:
+    """WHERE for a scoped write within ``folder``'s subtree.
 
-    Updates only rows that already exist (no annotation rows are created just to
-    store a NULL), so it's cheap even on huge subtrees.
+    The ``mat_path`` prefix is a Python-constant string here (unlike the
+    rollup self-join, see ``_descendant_of_pred``), so the plain LIKE is
+    planner-rewritten to an index range. ``view_filter`` composes all filter
+    axes with AND; its effective-value predicates hit the indexed
+    ``<field>_eff`` columns, evaluated against the pre-write state.
     """
     conds = [
         Node.dataset_id == folder.dataset_id,
@@ -804,8 +786,31 @@ def clear_field_under(
         conds.append(Node.id != folder.id)
     if files_only:
         conds.append(Node.is_dir.is_(False))
-    _apply_file_filters(conds, types=types, accessed_after=accessed_after,
-                        accessed_before=accessed_before)
+    view_pred = view_filter.build(Node) if view_filter is not None else None
+    if view_pred is not None:
+        conds.append(view_pred)
+    return conds
+
+
+def clear_field_under(
+    db: Session,
+    folder: Node,
+    field: str,
+    *,
+    include_self: bool = True,
+    files_only: bool = False,
+    view_filter: "ViewFilter | None" = None,
+    actor: str | None = None,
+) -> int:
+    """Null out ``field`` on existing annotations within ``folder``'s subtree.
+
+    Updates only rows that already exist (no annotation rows are created just to
+    store a NULL), so it's cheap even on huge subtrees.
+    """
+    conds = _subtree_write_conds(
+        folder, include_self=include_self, files_only=files_only,
+        view_filter=view_filter,
+    )
     subq = select(Node.id).where(and_(*conds))
     result = db.execute(
         update(Annotation)
@@ -822,37 +827,33 @@ def bulk_set_under(
     values: dict,
     *,
     include_self: bool = True,
-    types: list[str] | None = None,
-    accessed_after: date | None = None,
-    accessed_before: date | None = None,
     files_only: bool = False,
+    view_filter: "ViewFilter | None" = None,
     actor: str | None = None,
-) -> int:
+) -> tuple[int, bool]:
     """Write override values onto every node under ``folder`` matching filters.
 
     This is the explicit "stamp every descendant" path (used by bulk edit when a
     user wants concrete values on each row, e.g. assigning a JIRA ticket to a
     filtered set). Normal folder marking relies on inheritance and does not call
     this.
-    Returns the number of nodes whose annotation was written.
+    Returns ``(count, own_stamped)``: how many nodes were written, and whether
+    ``folder`` itself was among them. Callers need ``own_stamped`` to decide
+    whether the folder's own effective columns may take the fast direct-value
+    refresh -- ``include_self`` alone doesn't determine it, because the folder
+    can still be excluded by ``files_only`` or by not matching ``view_filter``
+    (e.g. a type filter never matches a folder row), and refreshing its own
+    columns with a value it was never given would corrupt them.
     """
-    conds = [
-        Node.dataset_id == folder.dataset_id,
-        Node.mat_path.like(f"{folder.mat_path}%"),
-    ]
-    if not include_self:
-        conds.append(Node.id != folder.id)
-    if files_only:
-        conds.append(Node.is_dir.is_(False))
-    _apply_file_filters(conds, types=types, accessed_after=accessed_after,
-                        accessed_before=accessed_before)
-
+    conds = _subtree_write_conds(
+        folder, include_self=include_self, files_only=files_only,
+        view_filter=view_filter,
+    )
     node_ids = [
         r[0] for r in db.execute(select(Node.id).where(and_(*conds))).all()
     ]
-    return _apply_annotation_values(
-        db, folder.dataset_id, node_ids, values, actor
-    )
+    count = _apply_annotation_values(db, folder.dataset_id, node_ids, values, actor)
+    return count, folder.id in node_ids
 
 
 def _apply_annotation_values(

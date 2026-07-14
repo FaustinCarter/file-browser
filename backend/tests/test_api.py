@@ -621,3 +621,226 @@ def test_multiple_datasets_isolated(client, loaded):
     r2 = client.get("/api/tree/children", params={"dataset_id": ds2["id"]}).json()
     assert r1["children"][0]["name"] == "Root"
     assert r2["children"][0]["name"] == "Other"
+
+
+# ---- Filter-scoped bulk edits across every filter axis (FILTERED_BULK_EDIT_PLAN) ----
+
+
+def _assert_eff_columns_consistent(dsid):
+    """Materialized <field>_eff columns must equal resolve_effective everywhere."""
+    from sqlalchemy import select
+
+    from app import services
+    from app.database import SessionLocal
+    from app.models import Node
+
+    db = SessionLocal()
+    try:
+        nodes = list(db.execute(select(Node).where(Node.dataset_id == dsid)).scalars())
+        ref = services.resolve_effective(db, nodes)
+        for n in nodes:
+            for f in services.MATERIALIZED_FIELDS:
+                assert getattr(n, f"{f}_eff") == ref[n.id]["effective"][f], (n.name, f)
+    finally:
+        db.close()
+
+
+def test_folder_flag_scoped_by_jira_filter(client, loaded):
+    """Filter by effective JIRA, then folder-flag: only files with that ticket
+    are touched; everything else (and the folder's own value) is left alone."""
+    ds = loaded
+    root = client.get("/api/tree/children", params={"dataset_id": ds["id"]}).json()["children"][0]
+    reports = _find(client, ds["id"], "Reports")
+    # Stamp MIG-9 onto the 2 PPTX files under Reports.
+    client.post(
+        "/api/nodes/bulk-annotation",
+        json={"node_id": reports["id"], "files_only": True, "types": ["PPTX File"],
+              "values": {"jira_ticket": "MIG-9"}},
+    )
+    # Flag Root scoped to jira=MIG-9 -> only deck.pptx + notes.pptx marked.
+    r = client.post(
+        f"/api/nodes/{root['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True, "jira": "MIG-9"},
+    )
+    assert r.status_code == 200
+    root_after = r.json()
+    assert root_after["own"]["no_transfer"] is None  # scoped: folder untouched
+    assert root_after["no_transfer_marked"] == 2 and root_after["total_files"] == 5
+
+    marked = client.get(
+        "/api/nodes/search",
+        params={"dataset_id": ds["id"], "is_dir": False, "no_transfer": "yes"},
+    ).json()
+    assert {i["name"] for i in marked["items"]} == {"deck.pptx", "notes.pptx"}
+    _assert_eff_columns_consistent(ds["id"])
+
+
+def test_folder_flag_scoped_by_flag_filter(client, loaded):
+    """Filter no_transfer='no' then set no_transfer: only the currently-unmarked
+    files get stamped (pre-write state), ending with everything marked."""
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    deck = _find(client, ds["id"], "deck.pptx")
+    client.patch(f"/api/nodes/{deck['id']}/annotation", json={"no_transfer": True})
+
+    r = client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True, "no_transfer": "no"},
+    )
+    rep = r.json()
+    assert rep["own"]["no_transfer"] is None  # scoped path, folder untouched
+    assert rep["no_transfer_marked"] == 3 and rep["total_files"] == 3
+
+    # notes + data were stamped (they were unmarked); deck kept its own value.
+    from sqlalchemy import select
+
+    from app.database import SessionLocal
+    from app.models import Annotation
+
+    db = SessionLocal()
+    try:
+        rows = {a.node_id: a.no_transfer for a in db.execute(
+            select(Annotation).where(Annotation.dataset_id == ds["id"])
+        ).scalars()}
+    finally:
+        db.close()
+    notes = _find(client, ds["id"], "notes.pptx")
+    data = _find(client, ds["id"], "data.xlsx")
+    assert rows.get(notes["id"]) is True and rows.get(data["id"]) is True
+    assert rows.get(deck["id"]) is True  # pre-existing own value untouched
+    assert reports["id"] not in rows  # no folder row created
+    _assert_eff_columns_consistent(ds["id"])
+
+
+def test_bulk_annotation_scoped_by_assignee_and_types(client, loaded):
+    """assignee=__none__ + type filter compose with AND for a scoped stamp."""
+    ds = loaded
+    root = client.get("/api/tree/children", params={"dataset_id": ds["id"]}).json()["children"][0]
+    images = _find(client, ds["id"], "Images")
+    # Images subtree inherits assignee=alice; Reports files stay unassigned.
+    client.patch(f"/api/nodes/{images['id']}/annotation", json={"assignee": "alice"})
+
+    r = client.post(
+        "/api/nodes/bulk-annotation",
+        json={"node_id": root["id"], "files_only": True,
+              "types": ["PPTX File", "JPG File"], "assignee": "__none__",
+              "values": {"jira_ticket": "MIG-77"}},
+    )
+    # PPTX (unassigned) match; a.jpg is JPG but effectively assigned -> excluded.
+    assert r.json()["updated"] == 2
+    got = client.get(
+        "/api/nodes/search", params={"dataset_id": ds["id"], "jira": "MIG-77"},
+    ).json()
+    assert {i["name"] for i in got["items"]} == {"deck.pptx", "notes.pptx"}
+    _assert_eff_columns_consistent(ds["id"])
+
+
+def test_folder_flag_scoped_clear_with_filter(client, loaded):
+    """A scoped clear with a JIRA filter nulls the field on exactly the matching
+    files' existing rows -- and never creates annotation rows to store NULLs."""
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    # All 3 files get own no_transfer=True; only the PPTX get a ticket.
+    client.post(
+        "/api/nodes/bulk-annotation",
+        json={"node_id": reports["id"], "files_only": True,
+              "values": {"no_transfer": True}},
+    )
+    client.post(
+        "/api/nodes/bulk-annotation",
+        json={"node_id": reports["id"], "files_only": True, "types": ["PPTX File"],
+              "values": {"jira_ticket": "MIG-5"}},
+    )
+
+    from sqlalchemy import func as sfunc, select
+
+    from app.database import SessionLocal
+    from app.models import Annotation
+
+    db = SessionLocal()
+    try:
+        before = db.execute(
+            select(sfunc.count()).select_from(Annotation)
+            .where(Annotation.dataset_id == ds["id"])
+        ).scalar_one()
+    finally:
+        db.close()
+
+    # Clear no_transfer scoped to jira=MIG-5 -> only the 2 PPTX unmarked.
+    r = client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "no_transfer", "value": None, "jira": "MIG-5"},
+    )
+    rep = r.json()
+    assert rep["no_transfer_marked"] == 1  # only data.xlsx still marked
+
+    db = SessionLocal()
+    try:
+        after = db.execute(
+            select(sfunc.count()).select_from(Annotation)
+            .where(Annotation.dataset_id == ds["id"])
+        ).scalar_one()
+    finally:
+        db.close()
+    assert after == before  # clear never creates rows
+    _assert_eff_columns_consistent(ds["id"])
+
+
+def test_eff_only_filter_takes_scoped_path(client, loaded):
+    """Regression for the audit hazard: with ONLY an effective-value filter
+    active (no type/date), a folder flag must run the scoped path -- not
+    silently wipe and restamp the whole subtree via the folder's own value."""
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    r = client.post(
+        f"/api/nodes/{reports['id']}/folder-flag",
+        json={"field": "processed", "value": True, "assignee": "__none__"},
+    )
+    rep = r.json()
+    assert rep["own"]["processed"] is None  # scoped: folder's own value untouched
+    assert rep["processed_marked"] == 3  # every file was unassigned -> all stamped
+    _assert_eff_columns_consistent(ds["id"])
+
+
+def test_stats_preview_matches_scoped_write_count(client, loaded):
+    """/stats with the full filter set counts exactly what the scoped write
+    then reports as updated."""
+    ds = loaded
+    reports = _find(client, ds["id"], "Reports")
+    deck = _find(client, ds["id"], "deck.pptx")
+    client.patch(f"/api/nodes/{deck['id']}/annotation", json={"no_transfer": True})
+
+    params = {"types": ["PPTX File"], "no_transfer": "no"}
+    preview = client.get(f"/api/nodes/{reports['id']}/stats", params=params).json()
+    r = client.post(
+        "/api/nodes/bulk-annotation",
+        json={"node_id": reports["id"], "files_only": True,
+              "types": ["PPTX File"], "no_transfer": "no",
+              "values": {"assignee": "bob"}},
+    )
+    assert preview["file_count"] == r.json()["updated"] == 1  # notes.pptx only
+    _assert_eff_columns_consistent(ds["id"])
+
+
+def test_bulk_by_filter_types_flag_and_comment(client, loaded):
+    """Grid path: type + flag filters compose, and comment is bulk-settable."""
+    ds = loaded
+    images = _find(client, ds["id"], "Images")
+    client.post(
+        f"/api/nodes/{images['id']}/folder-flag",
+        json={"field": "no_transfer", "value": True},
+    )
+    r = client.post(
+        "/api/nodes/bulk-by-filter",
+        json={"dataset_id": ds["id"], "files_only": True,
+              "types": ["JPG File", "PNG File", "PPTX File"], "no_transfer": "yes",
+              "values": {"comment": "review before move", "jira_ticket": "MIG-42"}},
+    )
+    # Only the Images files are effectively marked; PPTX are not -> 2 rows.
+    assert r.json()["updated"] == 2
+    a = client.get(f"/api/nodes/{_find(client, ds['id'], 'a.jpg')['id']}").json()
+    assert a["own"]["comment"] == "review before move"
+    assert a["own"]["jira_ticket"] == "MIG-42"
+    deck = client.get(f"/api/nodes/{_find(client, ds['id'], 'deck.pptx')['id']}").json()
+    assert deck["own"]["comment"] is None
+    _assert_eff_columns_consistent(ds["id"])

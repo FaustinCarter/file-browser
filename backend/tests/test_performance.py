@@ -234,8 +234,19 @@ def test_all_select_queries_under_budget(perf_client):
     check("counts/root", g, f"/api/nodes/{ids['root_id']}/counts")
     check("stats/root", g, f"/api/nodes/{ids['root_id']}/stats")
     check("stats/root+type", g, f"/api/nodes/{ids['root_id']}/stats", params={"types": [a_type]})
+    # The scoped-write "Apply to N" preview: full filter set on the root folder.
+    check("stats/root+full-filters", g, f"/api/nodes/{ids['root_id']}/stats", params={
+        "types": file_types, "accessed_after": "2020-01-01", "no_transfer": "no",
+        "jira": "__none__", "assignee": "__none__",
+    })
     check("node/get leaf-folder", g, f"/api/nodes/{ids['leaf_id']}")
     check("node/get dept-folder", g, f"/api/nodes/{ids['dept_id']}")
+
+    # ---- Tree navigation, all filter axes at once ----
+    check("tree/root+type+flag+jira+assignee", g, "/api/tree/children", params={
+        "dataset_id": dsid, "types": file_types, "no_transfer": "no",
+        "jira": "__none__", "assignee": "__none__",
+    })
 
     # ---- Type-counts (bulk folder query) ----
     check("type-counts/bulk", p, "/api/nodes/type-counts",
@@ -258,4 +269,116 @@ def test_all_select_queries_under_budget(perf_client):
     assert not over, (
         f"{len(over)}/{len(results)} queries exceeded the {BUDGET_SECONDS}s budget: "
         + ", ".join(f"{label}={elapsed:.2f}s" for label, elapsed, _ in over)
+    )
+
+
+# Bulk writes get a looser budget than reads: a write is a deliberate,
+# occasional action (reads happen on every click), and it pays for the
+# annotation upsert + the scoped effective-column refresh.
+WRITE_BUDGET_SECONDS = 10.0
+# One deliberate exception: a substring that scatters ~100k matches across the
+# entire tree (no bounding folder) is the accepted worst case -- measured
+# ~13-15s on the reference environment and signed off as acceptable. The 2x
+# budget pins it against *regression* without failing on accepted behavior.
+SCATTERED_100K_BUDGET_SECONDS = 2 * WRITE_BUDGET_SECONDS
+
+
+def test_write_scenarios_under_budget(perf_client):
+    """Bulk-write latency for the documented user workflows, including the
+    filter-scoped paths (flag/JIRA/assignee filters on folder-scoped writes).
+
+    Runs after the read test (module fixture is shared), so it may mutate the
+    dataset freely.
+    """
+    client, dataset, ids = perf_client
+    dsid = dataset["id"]
+
+    file_types = [r["file_type"] for r in client.get(
+        f"/api/datasets/{dsid}/file-types").json()][:10]
+
+    # A second, so-far-untouched department for the eff-filter folder flag.
+    depts = client.get(
+        "/api/tree/children", params={"dataset_id": dsid, "parent_id": ids["root_id"]},
+    ).json()["children"]
+    dept2_id = next(d["id"] for d in depts if d["is_dir"] and d["id"] != ids["dept_id"])
+
+    results: list[tuple[str, float, int, float]] = []
+
+    def check(label, method, path, *, budget=WRITE_BUDGET_SECONDS, **kwargs):
+        t0 = time.time()
+        resp = method(path, **kwargs)
+        elapsed = time.time() - t0
+        assert resp.status_code == 200, f"{label}: {resp.status_code} {resp.text[:300]}"
+        results.append((label, elapsed, resp.status_code, budget))
+        return resp
+
+    p = client.post
+
+    # 1. Grid: common path substring scatters matches across the whole tree,
+    #    select-all -> set flag (the accepted pathological worst case).
+    r = check(
+        "grid/q-scattered ~100k select-all set flag", p, "/api/nodes/bulk-by-filter",
+        budget=SCATTERED_100K_BUDGET_SECONDS,
+        json={"dataset_id": dsid, "q": "2021_", "files_only": True,
+              "values": {"no_transfer": True}},
+    )
+    assert r.json()["updated"] > 50_000  # sanity: this really is the big case
+
+    # 2. Grid: many file types simultaneously, select-all -> set assignee.
+    r = check(
+        "grid/10-types select-all set assignee", p, "/api/nodes/bulk-by-filter",
+        json={"dataset_id": dsid, "types": file_types, "files_only": True,
+              "values": {"assignee": "bob"}},
+    )
+    assert r.json()["updated"] > 10_000
+
+    # 3. Tree: folder + type filter + jira=__none__ -> bulk JIRA stamp (the
+    #    new combined effective-value scoping path).
+    check(
+        "tree/dept type+jira-none bulk JIRA stamp", p, "/api/nodes/bulk-annotation",
+        json={"node_id": ids["dept_id"], "files_only": True,
+              "types": file_types[:5], "jira": "__none__",
+              "values": {"jira_ticket": "MIG-900"}},
+    )
+
+    # 4. Tree: folder-flag scoped by an effective-value filter over a full
+    #    (~40k-file) department subtree.
+    r = check(
+        "tree/dept2 folder-flag scoped by no_transfer=no", p,
+        f"/api/nodes/{dept2_id}/folder-flag",
+        json={"field": "no_transfer", "value": True, "no_transfer": "no"},
+    )
+    rep = r.json()
+    assert rep["own"]["no_transfer"] is None  # scoped path
+    assert rep["no_transfer_marked"] == rep["total_files"]
+
+    # 5. Grid: scoped CLEAR over the multi-type set -- exercises the slower
+    #    COALESCE-with-parent refresh path (clearing can't use the direct-
+    #    literal fast path).
+    check(
+        "grid/10-types select-all CLEAR assignee", p, "/api/nodes/bulk-by-filter",
+        json={"dataset_id": dsid, "types": file_types, "files_only": True,
+              "values": {"assignee": None}},
+    )
+
+    # 6. Tree: scoped clear via folder-flag with a JIRA filter.
+    check(
+        "tree/dept folder-flag CLEAR scoped by jira", p,
+        f"/api/nodes/{ids['dept_id']}/folder-flag",
+        json={"field": "no_transfer", "value": None, "jira": "MIG-900"},
+    )
+
+    # ---- Report + assert ----
+    width = max(len(r[0]) for r in results)
+    over = [r for r in results if r[1] > r[3]]
+    print(f"\n[perf] {len(results)} write scenarios, budget={WRITE_BUDGET_SECONDS}s "
+          f"({SCATTERED_100K_BUDGET_SECONDS}s for the scattered-100k case), "
+          f"{len(over)} over budget")
+    for label, elapsed, _, budget in sorted(results, key=lambda r: -r[1]):
+        flag = " OVER BUDGET" if elapsed > budget else ""
+        print(f"  {elapsed:7.3f}s  (budget {budget:4.0f}s)  {label:<{width}}{flag}")
+
+    assert not over, (
+        f"{len(over)}/{len(results)} write scenarios exceeded budget: "
+        + ", ".join(f"{label}={elapsed:.2f}s>{budget:.0f}s" for label, elapsed, _, budget in over)
     )
