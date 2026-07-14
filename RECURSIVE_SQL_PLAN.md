@@ -1,5 +1,20 @@
 # Plan: Resolve effective annotation values with recursive SQL
 
+> **Status update:** Strategy A below (per-request recursive CTE) is
+> implemented and remains the correctness reference (`services.effective_cte`).
+> At real scale (~2M rows) it turned out too slow to run on every *read* as
+> planned — every tree/grid request paid a full-dataset walk regardless of
+> whether a flag/jira/assignee filter was active, since the folder rollups
+> need it unconditionally for their marked counts. Strategy B (materialized
+> `<field>_eff` columns, §4) has since been adopted for exactly the fields
+> that are filtered on, refreshed at write time for the affected subtree only
+> (not the whole dataset, which the "risk" callout under Strategy B below
+> assumed — see `services.refresh_effective_for_*` and the README's
+> "Performance at millions of rows" section). Reads now filter/rollup on
+> those columns directly; §5.1's CTE is used only by the refresh and by
+> `resolve_effective`'s equivalence test. The rest of this document is kept
+> as the historical design record and invariant list, which still holds.
+
 ## 1. Why
 
 Effective-value resolution (own value, else nearest-ancestor folder value) is

@@ -13,6 +13,11 @@ Design notes
   ``/1/5/23/``). Descendant queries are a single ``LIKE '/1/5/23/%'`` and
   ancestor lookups just split the string. This is portable (no ltree
   extension) and indexes well on Postgres at millions of rows.
+* The four annotation fields used for *filtering* (``no_transfer``,
+  ``processed``, ``jira_ticket``, ``assignee``) also get a materialized
+  ``<field>_eff`` column on ``Node`` holding their resolved (own-or-inherited)
+  value, indexed for fast filtering/rollups at millions of rows. See
+  ``services.refresh_effective_columns``.
 """
 from __future__ import annotations
 
@@ -83,6 +88,31 @@ class Node(Base):
     file_type: Mapped[str | None] = mapped_column(Text, nullable=True)  # "PPTX File"
     dir_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ---- Materialized effective-annotation columns (denormalized, writer-owned) ----
+    # A node's *effective* value for one of these fields is its own annotation
+    # value if set, else the value inherited from the nearest ancestor folder
+    # with one. That used to be recomputed with a recursive CTE on every read
+    # (search/tree/rollups) -- correct, but O(nodes) per request, which is fine
+    # at thousands of rows and is the dominant cost at millions. These columns
+    # cache that same computation so reads become plain indexed lookups; the
+    # only fields materialized are the ones actually used to *filter*
+    # (`services.ViewFilter`) -- ``target_location``/``comment`` are shown but
+    # never filtered on, so they stay on `Annotation` only.
+    #
+    # Kept in sync by the `services.refresh_effective_for_*` functions, which
+    # every annotation-mutating endpoint calls once (after its writes, before
+    # commit) to recompute these columns for exactly the affected subtree --
+    # O(that subtree), not O(dataset) -- using the same recursive-walk logic
+    # as `services.effective_cte` (the correctness reference; see
+    # `refresh_effective_columns`, its whole-dataset sibling used only for the
+    # one-time migration backfill). This moves the O(subtree) cost of
+    # resolving inheritance from every read to every write, which is the
+    # right trade here: reads vastly outnumber writes in this app's usage.
+    no_transfer_eff: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    processed_eff: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    jira_ticket_eff: Mapped[str | None] = mapped_column(Text, nullable=True)
+    assignee_eff: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     annotation: Mapped["Annotation"] = relationship(
         back_populates="node", uselist=False, cascade="all, delete-orphan"
     )
@@ -100,6 +130,13 @@ class Node(Base):
         Index("ix_nodes_type", "dataset_id", "file_type"),
         Index("ix_nodes_pathkey", "dataset_id", "path_key"),
         Index("ix_nodes_accessed", "dataset_id", "last_accessed"),
+        # Grid "sort by Dir Level" column -- low cardinality, but at millions
+        # of rows an index scan still beats an explicit in-memory sort.
+        Index("ix_nodes_dirlevel", "dataset_id", "dir_level"),
+        Index("ix_nodes_no_transfer_eff", "dataset_id", "no_transfer_eff"),
+        Index("ix_nodes_processed_eff", "dataset_id", "processed_eff"),
+        Index("ix_nodes_jira_eff", "dataset_id", "jira_ticket_eff"),
+        Index("ix_nodes_assignee_eff", "dataset_id", "assignee_eff"),
     )
 
 

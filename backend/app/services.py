@@ -7,7 +7,6 @@ from sqlalchemy import (
     Select,
     and_,
     func,
-    not_,
     select,
     update,
 )
@@ -32,6 +31,12 @@ BOOLEAN_FLAG_FIELDS = ("processed", "no_transfer")
 # Text (string) annotation fields, where empty string == "no value".
 TEXT_FIELDS = ("target_location", "jira_ticket", "comment", "assignee")
 
+# The subset of ANNOTATION_FIELDS that get a materialized `<field>_eff` column
+# on Node (i.e. the ones ViewFilter actually filters on). target_location and
+# comment are shown/edited but never filtered, so they stay CTE/ancestor-walk
+# only (resolve_effective) and don't need a materialized column.
+MATERIALIZED_FIELDS = ("no_transfer", "processed", "jira_ticket", "assignee")
+
 # Sentinel meaning "filter to records with no effective value for this field".
 UNASSIGNED = "__none__"
 
@@ -42,9 +47,17 @@ UNASSIGNED = "__none__"
 # from the nearest ancestor folder (files are leaves, so a file override only ever
 # affects itself). We resolve this with a single top-down tree walk by parent_id:
 # each child COALESCEs its own value over its parent's already-resolved value. The
-# walk visits every node once (O(nodes)), independent of how many overrides exist,
-# so filtering/rollups stay fast no matter how much has been annotated. Filters and
-# rollups then reference the CTE as a set (``node.id IN (SELECT id FROM eff ...)``).
+# walk visits every node once (O(nodes)), independent of how many overrides exist.
+#
+# This CTE is O(nodes) per evaluation, which is fine as an occasional per-request
+# cost but becomes the dominant cost at millions of rows if run on every read (it
+# was, until the refactor below). It is now used in exactly two places:
+#   1. `refresh_effective_columns` -- write time, once per mutating request, to
+#      materialize `Node.<field>_eff` for the fields that are actually filtered on
+#      (`MATERIALIZED_FIELDS`). Reads then filter/rollup on those plain columns.
+#   2. Kept directly usable (`effective_true_clause` etc.) for tests/tools that
+#      want the CTE-derived predicate itself, e.g. the "bounded SQL" regression
+#      test -- it is still the correctness reference, just off the read hot path.
 
 
 def _own_expr(ann, field):
@@ -116,6 +129,185 @@ def effective_true_clause(db: Session, dataset_id: int, field: str):
     return eff_true_pred(Node, effective_cte(dataset_id), field)
 
 
+def refresh_effective_columns(db: Session, dataset_id: int) -> None:
+    """Recompute ``Node.<field>_eff`` for every node in ``dataset_id``.
+
+    Runs the recursive CTE once (O(nodes)) and writes its result back onto the
+    materialized columns via a single ``UPDATE ... FROM`` statement.
+
+    This is O(dataset size), which is fine for a one-time migration backfill
+    (see ``main._init_schema``) but was measured to take well over a minute on
+    a 2.2M-row dataset -- unusable as a per-edit cost. Interactive writes use
+    the *scoped* refresh functions below instead, which cost O(affected
+    subtree) by construction. Nothing on the request path calls this function
+    anymore; keep it only for the migration backfill and as the "obviously
+    correct" reference the scoped functions are checked against.
+    """
+    eff = effective_cte(dataset_id)
+    stmt = (
+        update(Node)
+        .values(**{f"{f}_eff": eff.c[f"{f}_eff"] for f in MATERIALIZED_FIELDS})
+        .where(Node.id == eff.c.id, Node.dataset_id == dataset_id)
+    )
+    db.execute(stmt)
+
+
+# ---- Scoped (write-time) refresh: O(affected subtree), not O(dataset) ----
+#
+# A single annotation edit only ever changes the effective value of (a) the
+# edited node itself and (b), if it's a folder, its descendants that don't
+# have a nearer override. Recomputing the *whole dataset* on every edit (as
+# `refresh_effective_columns` does) is correct but pays for the entire tree
+# every time, which is what made a single edit take 100+ seconds at 2.2M rows.
+# These functions instead:
+#   1. Recompute exactly the touched node(s)' own effective value as
+#      COALESCE(its own current annotation, its parent's *current* eff
+#      columns) -- O(1) per node, since the parent's columns are already
+#      correct (the surrounding invariant this whole scheme relies on).
+#   2. For any touched node that's a folder, walk *only* its subtree with the
+#      same recursive step as `effective_cte`, seeded at the folder's just-
+#      updated eff columns -- O(that folder's subtree), not O(dataset).
+
+
+def _own_from_parent_select(dataset_id: int, node_ids: list[int]):
+    """Each of ``node_ids``' new effective value: its own (current) annotation,
+    else its parent's *current* ``<field>_eff`` (assumed already correct)."""
+    ann = aliased(Annotation)
+    parent = aliased(Node)
+    return (
+        select(
+            Node.id.label("id"),
+            *[
+                func.coalesce(_own_expr(ann, f), getattr(parent, f"{f}_eff")).label(f"{f}_eff")
+                for f in MATERIALIZED_FIELDS
+            ],
+        )
+        .select_from(Node)
+        .join(ann, ann.node_id == Node.id, isouter=True)
+        .join(parent, parent.id == Node.parent_id, isouter=True)
+        .where(Node.id.in_(node_ids), Node.dataset_id == dataset_id)
+    )
+
+
+def _refresh_own_from_parent(db: Session, dataset_id: int, node_ids: list[int]) -> None:
+    if not node_ids:
+        return
+    sub = _own_from_parent_select(dataset_id, node_ids).subquery()
+    stmt = (
+        update(Node)
+        .values(**{f"{f}_eff": sub.c[f"{f}_eff"] for f in MATERIALIZED_FIELDS})
+        .where(Node.id == sub.c.id)
+    )
+    db.execute(stmt)
+
+
+def _subtree_propagate_cte(dataset_id: int, root_ids: list[int]):
+    """Recursive CTE seeded at ``root_ids`` (whose eff columns must already be
+    current), walking down through their descendants only."""
+    anchor = select(
+        Node.id.label("id"),
+        *[getattr(Node, f"{f}_eff").label(f"{f}_eff") for f in MATERIALIZED_FIELDS],
+    ).where(Node.id.in_(root_ids))
+    eff = anchor.cte("eff_subtree", recursive=True)
+    child = aliased(Node)
+    ac = aliased(Annotation)
+    rec = (
+        select(
+            child.id.label("id"),
+            *[
+                func.coalesce(_own_expr(ac, f), eff.c[f"{f}_eff"]).label(f"{f}_eff")
+                for f in MATERIALIZED_FIELDS
+            ],
+        )
+        .select_from(eff)
+        .join(child, and_(child.parent_id == eff.c.id, child.dataset_id == dataset_id))
+        .join(ac, ac.node_id == child.id, isouter=True)
+    )
+    return eff.union_all(rec)
+
+
+def _propagate_subtrees(db: Session, dataset_id: int, root_ids: list[int]) -> None:
+    if not root_ids:
+        return
+    sub = _subtree_propagate_cte(dataset_id, root_ids)
+    stmt = (
+        update(Node)
+        .values(**{f"{f}_eff": sub.c[f"{f}_eff"] for f in MATERIALIZED_FIELDS})
+        .where(Node.id == sub.c.id)
+    )
+    db.execute(stmt)
+
+
+def _dedupe_nested_folders(db: Session, dataset_id: int, folder_ids: list[int]) -> list[int]:
+    """Drop any folder in ``folder_ids`` that is itself a descendant of another
+    folder in the same list -- its ancestor's subtree walk already covers it,
+    so re-walking it as its own root would just be wasted (harmless) work.
+
+    ``mat_path`` sorts so that a folder's descendants immediately follow it
+    (materialized path = literal ancestor-id prefix), so one linear pass over
+    paths sorted lexicographically is enough to find the "outermost" roots.
+    """
+    if not folder_ids:
+        return []
+    rows = db.execute(
+        select(Node.id, Node.mat_path)
+        .where(Node.id.in_(folder_ids), Node.dataset_id == dataset_id)
+        .order_by(Node.mat_path)
+    ).all()
+    roots: list[int] = []
+    last_prefix: str | None = None
+    for nid, mat_path in rows:
+        if last_prefix is not None and mat_path.startswith(last_prefix):
+            continue
+        roots.append(nid)
+        last_prefix = mat_path
+    return roots
+
+
+def refresh_effective_for_node(db: Session, dataset_id: int, node_id: int, *, is_dir: bool) -> None:
+    """A single node's own annotation was just written (upsert/clear).
+
+    O(1) for a file (leaf, nothing to propagate to); O(that folder's subtree)
+    for a folder, since descendants may now inherit a different value.
+    """
+    _refresh_own_from_parent(db, dataset_id, [node_id])
+    if is_dir:
+        _propagate_subtrees(db, dataset_id, [node_id])
+
+
+def refresh_effective_for_subtree(db: Session, dataset_id: int, folder_id: int) -> None:
+    """A bulk write touched some subset of ``folder_id``'s subtree (bulk-stamp,
+    scoped clear, folder-flag) -- possibly including ``folder_id`` itself.
+
+    O(that folder's subtree), never O(dataset), regardless of how much of the
+    subtree the write actually touched -- recomputing everything under one
+    bounded folder is simpler and still cheap relative to the dataset.
+    """
+    _refresh_own_from_parent(db, dataset_id, [folder_id])
+    _propagate_subtrees(db, dataset_id, [folder_id])
+
+
+def refresh_effective_for_nodes(db: Session, dataset_id: int, node_ids: list[int]) -> None:
+    """An arbitrary, possibly-scattered set of nodes were each just stamped
+    with their own value (grid "apply to every filtered row").
+
+    O(sum of touched folders' subtree sizes), not O(dataset): every touched
+    node's own value is recomputed directly, and any touched *folders* also
+    propagate to their descendants (deduped so nested touched folders aren't
+    walked twice).
+    """
+    if not node_ids:
+        return
+    _refresh_own_from_parent(db, dataset_id, node_ids)
+    dir_ids = [
+        r[0] for r in db.execute(
+            select(Node.id).where(Node.id.in_(node_ids), Node.is_dir.is_(True))
+        ).all()
+    ]
+    roots = _dedupe_nested_folders(db, dataset_id, dir_ids)
+    _propagate_subtrees(db, dataset_id, roots)
+
+
 def ancestor_ids_self_first(mat_path: str) -> list[int]:
     """['/1/5/23/'] -> [23, 5, 1] (self first, then up to the root)."""
     ids = [int(x) for x in mat_path.strip("/").split("/") if x]
@@ -173,6 +365,39 @@ def resolve_effective(db: Session, nodes: list[Node]) -> dict[int, dict]:
     return out
 
 
+def _descendant_of_pred(ancestor_mat_path, descendant_mat_path):
+    """"Descendant is under ancestor" as an indexable range, for a *correlated*
+    (per-row) ancestor path -- e.g. a self-join over many folders at once.
+
+    ``descendant_mat_path.like(ancestor_mat_path + '%')`` reads naturally but
+    can't use the ``text_pattern_ops`` prefix index here: Postgres only
+    rewrites ``LIKE 'prefix%'`` into an index range scan when the pattern is a
+    constant known at plan time, and a per-row column value isn't one -- it
+    silently falls back to evaluating the LIKE as a join filter over a full
+    scan of every row (O(nodes) per folder, i.e. O(nodes * folders) total).
+    Measured on a 2.2M-row / 555k-folder dataset: a 125-folder rollup went
+    from ~39s (Seq Scan + nested-loop filter) to ~0.2s (Nested Loop + Index
+    Scan) after this rewrite -- same result set, same index, different
+    operators.
+    ``text_pattern_ops`` indexes the C-locale pattern-comparison operators
+    (``~>=~``/``~<~``, not the locale-aware default ``>=``/``<``), so an
+    explicit range in those operators over ``[ancestor, ancestor-with-last-
+    char-bumped)`` *is* plannable as a per-row indexed range scan. Every
+    ``mat_path`` ends in ``/`` (see models.py), so bumping the trailing ``/``
+    (0x2F) to ``0`` (0x30) is a safe exclusive upper bound: any descendant
+    path is ``ancestor + suffix``, whose character at that position is still
+    ``/`` and therefore always sorts before the bumped bound, regardless of
+    ``suffix``.
+    """
+    upper = func.left(
+        ancestor_mat_path, func.length(ancestor_mat_path) - 1
+    ).concat("0").self_group()
+    return and_(
+        descendant_mat_path.op("~>=~")(ancestor_mat_path),
+        descendant_mat_path.op("~<~")(upper),
+    )
+
+
 def _descendant_files_filter(node: Node, *, types, accessed_after, accessed_before):
     """Build the WHERE clause for files strictly under ``node`` matching filters."""
     conds = [
@@ -218,19 +443,19 @@ def folder_stats(
 class ViewFilter:
     """Rebindable view filter: renders the same predicate against any node alias.
 
-    The effective-value parts (flags / jira / assignee) are semi-joins against a
-    shared ``cte`` (one recursive walk per statement); the raw parts (type /
-    last-accessed) reference the given node alias directly. ``build(node)`` is
-    called with ``Node`` for the flat grid/search and with the descendant alias for
-    the folder rollups, so search, rollups, and the type breakdown all share one
+    The effective-value parts (flags / jira / assignee) are plain equality/NULL
+    checks against the materialized ``<field>_eff`` columns (indexed, O(1) per
+    row) -- no recursive walk at read time. The raw parts (type / last-accessed)
+    reference the given node alias directly. ``build(node)`` is called with
+    ``Node`` for the flat grid/search and with the descendant alias for the
+    folder rollups, so search, rollups, and the type breakdown all share one
     filter definition (no drift).
     """
 
     def __init__(
-        self, cte, *, types=None, accessed_after=None, accessed_before=None,
+        self, *, types=None, accessed_after=None, accessed_before=None,
         no_transfer=None, processed=None, jira=None, assignee=None,
     ):
-        self.cte = cte
         self.types = types
         self.accessed_after = accessed_after
         self.accessed_before = accessed_before
@@ -257,19 +482,21 @@ class ViewFilter:
             conds.append(node.last_accessed <= self.accessed_before)
         for field, state in (("no_transfer", self.no_transfer),
                              ("processed", self.processed)):
+            col = getattr(node, f"{field}_eff")
             if state == "yes":
-                conds.append(eff_true_pred(node, self.cte, field))
+                conds.append(col.is_(True))
             elif state == "no":
-                # "not effectively marked" == effective false OR null; the semi-join
-                # subquery yields only non-null ids, so NOT IN stays NULL-safe.
-                conds.append(not_(eff_true_pred(node, self.cte, field)))
+                # "not effectively marked" == effective false OR null; IS NOT
+                # TRUE is NULL-safe on a plain boolean column.
+                conds.append(col.isnot(True))
         for field, value in (("jira_ticket", self.jira), ("assignee", self.assignee)):
             if not value:
                 continue
+            col = getattr(node, f"{field}_eff")
             if value == UNASSIGNED:
-                conds.append(eff_isnull_pred(node, self.cte, field))
+                conds.append(col.is_(None))
             else:
-                conds.append(eff_equals_pred(node, self.cte, field, value))
+                conds.append(col == value)
         return and_(*conds) if conds else None
 
 
@@ -285,22 +512,20 @@ def build_filters(
     jira: str | None = None,
     assignee: str | None = None,
 ) -> dict:
-    """Build the shared effective-value CTE and a rebindable ``ViewFilter``.
+    """Build a rebindable ``ViewFilter`` over the materialized effective columns.
 
     ``no_transfer`` / ``processed`` are tri-state: None (any), "yes" (show only
     effectively-marked), or "no" (hide effectively-marked). ``jira`` / ``assignee``
     filter on the *effective* value: a specific string matches that value, the
     ``UNASSIGNED`` sentinel ("__none__") matches records with no effective value.
-    Returns the ``cte`` (reused by the rollups for their marked counts), the
-    ``view_filter`` spec, and whether any filter is active.
+    Returns the ``view_filter`` spec and whether any filter is active.
     """
-    cte = effective_cte(dataset_id)
     vf = ViewFilter(
-        cte, types=types, accessed_after=accessed_after,
+        types=types, accessed_after=accessed_after,
         accessed_before=accessed_before, no_transfer=no_transfer,
         processed=processed, jira=jira, assignee=assignee,
     )
-    return {"cte": cte, "view_filter": vf, "filter_active": vf.active}
+    return {"view_filter": vf, "filter_active": vf.active}
 
 
 def distinct_values(db: Session, dataset_id: int, field: str) -> list[str]:
@@ -321,7 +546,6 @@ def folder_metrics_bulk(
     db: Session,
     folders: list[Node],
     *,
-    cte,
     view_filter: "ViewFilter | None" = None,
 ) -> dict[int, dict]:
     """Rollup over each folder's descendant files, for many folders in ONE query.
@@ -329,8 +553,9 @@ def folder_metrics_bulk(
     For every folder in ``folders`` returns the total descendant-file count, the
     filtered file count/size (respecting ``view_filter``), and how many files are
     *effectively* marked no_transfer / processed (for the tri-state checkbox). All
-    counts exclude sub-folders and the folder itself, and the marked counts use the
-    shared ``cte`` so a file under a marked folder counts even with no own value.
+    counts exclude sub-folders and the folder itself; the marked counts read the
+    materialized ``<field>_eff`` columns, so a file under a marked folder counts
+    even with no own value, with no recursive walk at read time.
     """
     if not folders:
         return {}
@@ -339,13 +564,13 @@ def folder_metrics_bulk(
     is_file = d.is_dir.is_(False)
     join_cond = and_(
         d.dataset_id == f.dataset_id,
-        d.mat_path.like(f.mat_path.concat("%")),
+        _descendant_of_pred(f.mat_path, d.mat_path),
         d.id != f.id,
     )
     view_pred = view_filter.build(d) if view_filter is not None else None
     filtered = and_(is_file, view_pred) if view_pred is not None else is_file
-    nt = and_(is_file, eff_true_pred(d, cte, "no_transfer"))
-    pc = and_(is_file, eff_true_pred(d, cte, "processed"))
+    nt = and_(is_file, d.no_transfer_eff.is_(True))
+    pc = and_(is_file, d.processed_eff.is_(True))
 
     stmt = (
         select(
@@ -615,8 +840,15 @@ def grid_filter_conds(
 
 def bulk_set_matching(
     db: Session, *, dataset_id: int, values: dict, actor: str | None = None, **filters
-) -> int:
-    """Apply ``values`` to every node matching the grid filter (all pages)."""
+) -> tuple[int, list[int]]:
+    """Apply ``values`` to every node matching the grid filter (all pages).
+
+    Returns ``(count, node_ids)`` -- the caller needs ``node_ids`` (an
+    arbitrary, possibly scattered set spanning the whole dataset, unlike the
+    other bulk paths which are bounded to one folder's subtree) to scope the
+    effective-column refresh to just what was touched.
+    """
     conds, _ = grid_filter_conds(db, dataset_id, **filters)
     node_ids = [r[0] for r in db.execute(select(Node.id).where(and_(*conds))).all()]
-    return _apply_annotation_values(db, dataset_id, node_ids, values, actor)
+    count = _apply_annotation_values(db, dataset_id, node_ids, values, actor)
+    return count, node_ids

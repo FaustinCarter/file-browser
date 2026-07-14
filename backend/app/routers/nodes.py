@@ -64,7 +64,7 @@ def search(
     the read-only file-system owner from the CSV.
     """
     try:
-        conds, f = services.grid_filter_conds(
+        conds, _f = services.grid_filter_conds(
             db, dataset_id, q=q, types=types, owner=owner, is_dir=is_dir,
             jira=jira, assignee=assignee, processed=processed,
             no_transfer=no_transfer, accessed_after=accessed_after,
@@ -73,19 +73,32 @@ def search(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    stmt = select(Node).where(and_(*conds))
-
+    # Two separate queries -- an exact COUNT(*) and a top-N-sorted page fetch --
+    # rather than a combined `count(*) OVER ()`: a window function must
+    # materialize and count the *entire* filtered+ordered result before a
+    # LIMIT can apply, which defeats Postgres's top-N heapsort (cheap partial
+    # sort that stops once it has `page_size` rows) and, at millions of
+    # matching rows, spills to disk. Two plain queries let the planner pick the
+    # cheap plan for each independently (index-only count; top-N sort fetch).
+    # The count only needs `id` -- selecting whole rows here just to discard
+    # them would carry every column through the count needlessly.
     total = db.execute(
-        select(func.count()).select_from(stmt.subquery())
+        select(func.count()).select_from(select(Node.id).where(and_(*conds)).subquery())
     ).scalar_one()
 
     col = _SORT_COLUMNS.get(sort, Node.full_path)
     col = col.desc() if direction == "desc" else col.asc()
-    stmt = stmt.order_by(col).offset((page - 1) * page_size).limit(page_size)
-
+    stmt = (
+        select(Node)
+        .where(and_(*conds))
+        .order_by(col)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
     nodes = list(db.execute(stmt).scalars().all())
+
     # Flat grid: folder rows show total (unfiltered) rollups, so no view_filter.
-    items = build_node_outs(db, nodes, cte=f["cte"])
+    items = build_node_outs(db, nodes)
     return {"total": int(total), "page": page, "page_size": page_size, "items": items}
 
 
@@ -113,8 +126,7 @@ def folder_type_counts(req: FolderTypeCountRequest, db: Session = Depends(get_db
 
 
 def _single_node_out(db: Session, node: Node) -> NodeOut:
-    f = services.build_filters(db, node.dataset_id)
-    return build_node_outs(db, [node], cte=f["cte"])[0]
+    return build_node_outs(db, [node])[0]
 
 
 @router.get("/{node_id}", response_model=NodeOut)
@@ -187,6 +199,7 @@ def update_annotation(
     # Only apply fields the client actually sent (so we can clear vs ignore).
     values = payload.model_dump(exclude_unset=True)
     services.upsert_annotation(db, node, values, actor=actor)
+    services.refresh_effective_for_node(db, node.dataset_id, node.id, is_dir=node.is_dir)
     db.commit()
     db.refresh(node)
     return _single_node_out(db, node)
@@ -236,6 +249,7 @@ def folder_flag(
         services.clear_field_under(db, node, field, include_self=True, actor=actor)
         if payload.value is not None:
             services.upsert_annotation(db, node, {field: payload.value}, actor=actor)
+    services.refresh_effective_for_subtree(db, node.dataset_id, node.id)
     db.commit()
     db.refresh(node)
     return _single_node_out(db, node)
@@ -262,6 +276,7 @@ def bulk_annotation(
         accessed_before=payload.accessed_before,
         actor=actor,
     )
+    services.refresh_effective_for_subtree(db, node.dataset_id, node.id)
     db.commit()
     return {"updated": count}
 
@@ -277,7 +292,7 @@ def bulk_by_filter(
     if not values:
         raise HTTPException(status_code=400, detail="No values provided")
     try:
-        count = services.bulk_set_matching(
+        count, touched_ids = services.bulk_set_matching(
             db,
             dataset_id=payload.dataset_id,
             values=values,
@@ -298,5 +313,8 @@ def bulk_by_filter(
         )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    # The grid filter can match a scattered set spanning the whole dataset (no
+    # single bounding folder), so scope the refresh to exactly what matched.
+    services.refresh_effective_for_nodes(db, payload.dataset_id, touched_ids)
     db.commit()
     return {"updated": count}

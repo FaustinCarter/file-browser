@@ -67,9 +67,7 @@ def children(
         ).scalars().all()
     )
 
-    folder_outs = build_node_outs(
-        db, folders, cte=f["cte"], view_filter=f["view_filter"],
-    )
+    folder_outs = build_node_outs(db, folders, view_filter=f["view_filter"])
     if f["filter_active"]:
         folder_outs = [fo for fo in folder_outs if (fo.filtered_file_count or 0) > 0]
 

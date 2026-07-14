@@ -161,6 +161,61 @@ Other levers:
 After changing `.env`, `docker compose up -d` recreates the containers with the
 new settings (no rebuild needed for DB tuning).
 
+### Performance at millions of rows
+
+Effective-value filtering (No-Transfer/Processed/JIRA/Assignee — own value or
+inherited from the nearest ancestor folder) and the per-folder tri-state
+rollups used to be resolved with a recursive SQL walk **on every read**. That
+is correct and fine up to a few hundred thousand rows, but at a real ~2M-row
+export it made *every* tree/grid request take several seconds to tens of
+seconds, because a full-dataset tree walk ran on every page load regardless of
+whether any flag/jira/assignee filter was even active.
+
+`no_transfer`, `processed`, `jira_ticket`, and `assignee` now also get a
+**materialized `<field>_eff` column** on `nodes` holding the resolved
+(own-or-inherited) value, indexed for plain filtered lookups. Every write that
+touches an annotation (single edit, folder-flag, bulk stamp) recomputes those
+columns for exactly the affected subtree afterward — O(that subtree), not
+O(dataset) — so a single-file edit is instant and even a large folder-flag
+stays a small, bounded write, while every *read* becomes a simple indexed
+`WHERE`/`JOIN` instead of a per-request tree walk. The recursive CTE itself is
+unchanged and still the correctness reference (`services.effective_cte`); see
+the docstrings in `app/services.py` and `app/models.py` for the exact
+mechanism, and `RECURSIVE_SQL_PLAN.md` for the earlier (read-time-only)
+design this supersedes at real scale.
+
+The other real bottleneck at scale was a self-join used by the folder rollups
+(`d.mat_path LIKE f.mat_path || '%'`): Postgres only turns `LIKE 'prefix%'`
+into an index range scan when the pattern is a *constant*, so a per-row
+column pattern silently fell back to a full table scan joined against every
+folder in view. It's rewritten as an explicit range over the `mat_path`
+prefix index's pattern-comparison operators (`~>=~`/`~<~`), which *is*
+plannable as an indexed nested loop — see `services._descendant_of_pred`.
+
+**Verify it yourself** with a synthetic dataset at real scale (≥1M files,
+≥500k folders, ≥500 file types):
+
+```bash
+cd backend
+. .venv/bin/activate   # or: python3 -m venv .venv && pip install -r requirements.txt
+RUN_PERF_TESTS=1 DATABASE_URL=postgresql+psycopg2://user:pass@localhost/perftest \
+    pytest tests/test_performance.py -s
+```
+
+This generates and imports a ~2.2M-row dataset (a few minutes) and asserts
+every kind of SELECT the UI issues — tree navigation at every depth, the flat
+grid, type breakdowns, counts/stats, node detail — returns in under 3 seconds
+across a matrix of filter/sort/pagination combinations. It's opt-in (skipped
+by a plain `pytest` run) because of that setup cost. See
+`backend/scripts/generate_large_fake_data.py` if you want the standalone
+generator (it streams rows to disk with an O(rows) bottom-up rollup, unlike
+`generate_fake_data.py` below, which is only meant for the ~1k-row demo
+dataset).
+
+At real scale, also turn on `ENABLE_TRGM_INDEX=1` (above) — substring search
+(`q=`) still has to touch every matching row, and a common word can match a
+large fraction of the table without a trigram index to narrow it first.
+
 ---
 
 ## Local development (without Docker)

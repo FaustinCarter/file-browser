@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import services
 from .database import Base, engine
 from .routers import datasets, nodes, tree
 from sqlalchemy import text
@@ -69,8 +70,47 @@ def _init_schema():
                             f"CREATE INDEX IF NOT EXISTS {name} ON annotations ({cols})"
                         )
                     )
+
+                # Materialized effective-value columns on nodes (see models.py):
+                # a one-time addition on an existing table needs both the new
+                # columns/indexes AND a backfill, since ADD COLUMN leaves them
+                # NULL for every existing row -- without the backfill, an
+                # upgraded dataset's filters/rollups would look "empty" until
+                # its next annotation edit.
+                needs_eff_backfill = not bool(
+                    conn.execute(
+                        text(
+                            "SELECT 1 FROM information_schema.columns "
+                            "WHERE table_name='nodes' AND column_name='no_transfer_eff'"
+                        )
+                    ).first()
+                )
+                for name, ddl_type in (
+                    ("no_transfer_eff", "boolean"),
+                    ("processed_eff", "boolean"),
+                    ("jira_ticket_eff", "text"),
+                    ("assignee_eff", "text"),
+                ):
+                    conn.execute(
+                        text(f"ALTER TABLE nodes ADD COLUMN IF NOT EXISTS {name} {ddl_type}")
+                    )
+                for name, cols in (
+                    ("ix_nodes_no_transfer_eff", "dataset_id, no_transfer_eff"),
+                    ("ix_nodes_processed_eff", "dataset_id, processed_eff"),
+                    ("ix_nodes_jira_eff", "dataset_id, jira_ticket_eff"),
+                    ("ix_nodes_assignee_eff", "dataset_id, assignee_eff"),
+                    ("ix_nodes_dirlevel", "dataset_id, dir_level"),
+                ):
+                    conn.execute(
+                        text(f"CREATE INDEX IF NOT EXISTS {name} ON nodes ({cols})")
+                    )
         # create_all is a no-op for existing tables; runs inside the same lock.
         Base.metadata.create_all(bind=conn)
+
+        if is_pg and table_exists and needs_eff_backfill:
+            ds_ids = [r[0] for r in conn.execute(text("SELECT id FROM datasets")).all()]
+            for dsid in ds_ids:
+                services.refresh_effective_columns(conn, dsid)
 
     _maybe_build_trgm_index(is_pg)
 

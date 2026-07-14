@@ -27,7 +27,6 @@ def build_node_outs(
     db: Session,
     nodes: list[Node],
     *,
-    cte=None,
     view_filter=None,
     with_folder_stats: bool = True,
 ) -> list[NodeOut]:
@@ -37,16 +36,13 @@ def build_node_outs(
     has_kids = _children_presence(db, [n.id for n in nodes])
 
     # One batched rollup query for every directory in this page (not one per
-    # folder). The rollups always need the effective-value CTE for their marked
-    # counts, so build one if the caller didn't pass a shared one.
+    # folder). The marked counts read the materialized effective columns
+    # directly, so no shared CTE is needed here.
     metrics: dict[int, dict] = {}
     if with_folder_stats:
         dirs = [n for n in nodes if n.is_dir]
         if dirs:
-            rollup_cte = cte if cte is not None else services.effective_cte(dirs[0].dataset_id)
-            metrics = services.folder_metrics_bulk(
-                db, dirs, cte=rollup_cte, view_filter=view_filter
-            )
+            metrics = services.folder_metrics_bulk(db, dirs, view_filter=view_filter)
 
     out: list[NodeOut] = []
     for n in nodes:
